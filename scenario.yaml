@@ -1,0 +1,61 @@
+scenario_name: room_32_32_4_visual_start
+
+description: >
+  Initial visual experiment configuration.
+  The benchmark map is selected at launch time using map_name:=...
+  Robots are placed by grid cell so any MovingAI map can be loaded dynamically.
+
+experiment:
+  method: source_linked
+  duration_sec: 120
+  update_rate_hz: 2.0
+  random_seed: 8
+
+visualization:
+  cell_size_m: 0.5
+  wall_height_m: 0.6
+  wall_z_m: 0.3
+  robot_height_m: 0.25
+  robot_z_m: 0.125
+
+robots:
+  - id: benign_1
+    role: benign_navigator
+    model: simple_box_robot
+    start_cell: [1, 1]
+    goal_cell: [14, 14]
+    enabled: true
+
+  - id: benign_2
+    role: benign_reporter
+    model: simple_box_robot
+    start_cell: [3, 3]
+    goal_cell: null
+    enabled: true
+
+  - id: malicious_1
+    role: malicious_reporter
+    model: simple_box_robot
+    start_cell: [6, 6]
+    goal_cell: null
+    enabled: true
+
+evaluation:
+  primary_robot: benign_1
+
+trust:
+  initial_value: 0.70
+  accept_threshold: 0.55
+  reward: 0.08
+  penalty: 0.18
+  contradiction_eta: 0.05
+
+claims:
+  mode: scripted
+  claim_file: null
+
+logging:
+  results_dir: results
+  save_metrics: true
+  save_claim_log: true
+  save_trust_log: true
