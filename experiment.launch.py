@@ -3,6 +3,7 @@ import yaml
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
+from launch.actions import SetEnvironmentVariable, TimerAction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
@@ -61,14 +62,6 @@ def cell_to_world(row, col, cell_size):
     x = (col + 0.5) * cell_size
     y = (row + 0.5) * cell_size
     return x, y
-
-
-def robot_material_for_role(role):
-    if role == "malicious_reporter":
-        return "0.8 0.05 0.05 1"
-    if role == "benign_reporter":
-        return "0.05 0.25 0.9 1"
-    return "0.05 0.75 0.25 1"
 
 
 def extract_horizontal_wall_segments(grid):
@@ -152,14 +145,40 @@ def append_box_model(
     parts.append('    </model>')
 
 
+def append_real_turtlebot3_burger(parts, name, x, y, yaw=0.0):
+    parts.append(f"""
+    <include>
+      <name>{name}</name>
+      <pose>{x} {y} 0.01 0 0 {yaw}</pose>
+      <uri>model://turtlebot3_burger</uri>
+    </include>
+    """)
+
+
+def get_turtlebot3_model_paths():
+    ros_distro = os.environ.get("ROS_DISTRO", "jazzy")
+
+    models_dir = f"/opt/ros/{ros_distro}/share/turtlebot3_gazebo/models"
+    model_file = os.path.join(models_dir, "turtlebot3_burger", "model.sdf")
+
+    if not os.path.exists(model_file):
+        raise RuntimeError(
+            "Could not find TurtleBot3 Burger model.sdf.\n"
+            f"Expected: {model_file}\n\n"
+            "Install the TurtleBot3 Gazebo package with:\n"
+            f"  sudo apt install ros-{ros_distro}-turtlebot3-gazebo "
+            f"ros-{ros_distro}-turtlebot3-description\n"
+        )
+
+    return models_dir, model_file
+
+
 def generate_sdf_world(map_name, map_data, scenario, output_path):
     visualization = scenario.get("visualization", {})
 
     cell_size = float(visualization.get("cell_size_m", 0.5))
     wall_height = float(visualization.get("wall_height_m", 0.6))
     wall_z = float(visualization.get("wall_z_m", wall_height / 2.0))
-    robot_height = float(visualization.get("robot_height_m", 0.25))
-    robot_z = float(visualization.get("robot_z_m", robot_height / 2.0))
 
     width = int(map_data["width"])
     height = int(map_data["height"])
@@ -227,23 +246,25 @@ def generate_sdf_world(map_name, map_data, scenario, output_path):
             continue
 
         robot_id = str(robot["id"])
-        role = str(robot["role"])
         start_cell = robot["start_cell"]
 
         row = int(start_cell[0])
         col = int(start_cell[1])
         x, y = cell_to_world(row, col, cell_size)
 
-        material = robot_material_for_role(role)
+        yaw = float(
+            robot.get(
+                "start_yaw",
+                robot.get("yaw", 0.0),
+            )
+        )
 
-        append_box_model(
+        append_real_turtlebot3_burger(
             parts=parts,
             name=robot_id,
-            pose_xyz_rpy=[x, y, robot_z, 0, 0, 0],
-            size_xyz=[cell_size * 0.7, cell_size * 0.7, robot_height],
-            ambient_rgba=material,
-            diffuse_rgba=material,
-            static=True,
+            x=x,
+            y=y,
+            yaw=yaw,
         )
 
     parts.append('  </world>')
@@ -259,11 +280,60 @@ def generate_sdf_world(map_name, map_data, scenario, output_path):
     )
 
 
+def make_optional_bridge_actions(map_name, scenario, bridge_robot_topics):
+    if not bridge_robot_topics:
+        return []
+
+    world_name = f"{map_name}_world"
+    bridge_actions = []
+
+    for robot in scenario.get("robots", []):
+        if not robot.get("enabled", True):
+            continue
+
+        robot_id = str(robot["id"])
+
+        bridge_actions.append(
+            Node(
+                package="ros_gz_bridge",
+                executable="parameter_bridge",
+                name=f"{robot_id}_bridge",
+                output="screen",
+                arguments=[
+                    f"/model/{robot_id}/cmd_vel@geometry_msgs/msg/Twist]gz.msgs.Twist",
+                    f"/model/{robot_id}/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry",
+                    (
+                        f"/world/{world_name}/model/{robot_id}/link/base_scan/"
+                        "sensor/hls_lfcd_lds/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan"
+                    ),
+                ],
+                remappings=[
+                    (f"/model/{robot_id}/cmd_vel", f"/{robot_id}/cmd_vel"),
+                    (f"/model/{robot_id}/odometry", f"/{robot_id}/odom"),
+                    (
+                        f"/world/{world_name}/model/{robot_id}/link/base_scan/"
+                        "sensor/hls_lfcd_lds/scan",
+                        f"/{robot_id}/scan",
+                    ),
+                ],
+            )
+        )
+
+    return bridge_actions
+
+
+def parse_bool(value):
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def prepare_generated_world(context):
     package_share = get_package_share_directory("trust_costmap")
 
     map_name = LaunchConfiguration("map_name").perform(context)
     scenario_file = LaunchConfiguration("scenario_file").perform(context)
+    bridge_robot_topics = parse_bool(
+        LaunchConfiguration("bridge_robot_topics").perform(context)
+    )
 
     map_path = os.path.join(
         package_share,
@@ -294,12 +364,50 @@ def prepare_generated_world(context):
     map_data = load_movingai_map(map_path)
     generate_sdf_world(map_name, map_data, scenario, generated_world_path)
 
-    return [
+    turtlebot3_models_dir, _ = get_turtlebot3_model_paths()
+
+    existing_resource_path = os.environ.get("GZ_SIM_RESOURCE_PATH", "")
+    if existing_resource_path:
+        gz_resource_path = existing_resource_path + os.pathsep + turtlebot3_models_dir
+    else:
+        gz_resource_path = turtlebot3_models_dir
+
+    bridge_actions = make_optional_bridge_actions(
+        map_name=map_name,
+        scenario=scenario,
+        bridge_robot_topics=bridge_robot_topics,
+    )
+
+    actions = [
+        SetEnvironmentVariable(
+            name="GZ_SIM_RESOURCE_PATH",
+            value=gz_resource_path,
+        ),
+
         ExecuteProcess(
-            cmd=["gz", "sim", "--render-engine", "ogre", "-r", generated_world_path],
+            cmd=[
+                "gz",
+                "sim",
+                "--render-engine",
+                "ogre",
+                "-r",
+                "-v",
+                "1",
+                generated_world_path,
+            ],
             output="screen",
-        )
+        ),
     ]
+
+    if bridge_actions:
+        actions.append(
+            TimerAction(
+                period=5.0,
+                actions=bridge_actions,
+            )
+        )
+
+    return actions
 
 
 def generate_launch_description():
@@ -315,10 +423,20 @@ def generate_launch_description():
         description="Scenario YAML file in the trust_costmap package root",
     )
 
+    bridge_robot_topics_arg = DeclareLaunchArgument(
+        "bridge_robot_topics",
+        default_value="false",
+        description=(
+            "If true, start ros_gz_bridge parameter bridges for each robot's "
+            "cmd_vel, odom, and scan topics."
+        ),
+    )
+
     return LaunchDescription(
         [
             map_name_arg,
             scenario_file_arg,
+            bridge_robot_topics_arg,
 
             OpaqueFunction(function=prepare_generated_world),
 

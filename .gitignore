@@ -1,21 +1,21 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
 
-# ROS / colcon artifacts
+# ROS / colcon outputs
 build/
 install/
 log/
 
-# Generated Gazebo files
-worlds/generated_*.sdf
-
-# Downloaded benchmark archive
-worlds/mapf-map.zip
-
-# Optional: uncomment this if you do NOT want to upload all benchmark maps
-# worlds/movingai_mapf/
-
-# Editor files
+# Local editor settings
 .vscode/
 .idea/
+
+# Generated Gazebo worlds
+worlds/generated_*.sdf
+worlds/generated_*.world
+
+# Logs/temp files
+*.log
+*.tmp
