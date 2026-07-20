@@ -58,10 +58,17 @@ class ExperimentManagerNode(Node):
 
         visualization = self.scenario.get("visualization", {})
         self.cell_size_m = float(visualization.get("cell_size_m", 0.5))
+        self.action_goal_size_m = float(
+            visualization.get("action_goal_size_m", 0.18)
+        )
+        self.action_goal_height_m = float(
+            visualization.get("action_goal_height_m", 0.04)
+        )
         self.robots = self.load_robots(self.scenario.get("robots", []))
         self.action_goals = self.load_action_goals(
             self.scenario.get("action_goals", [])
         )
+        self.validate_generated_settings()
         self.validate_layout()
 
         self.base_map_pub = self.create_publisher(OccupancyGrid, "/base_map", 10)
@@ -182,6 +189,21 @@ class ExperimentManagerNode(Node):
     def is_free(self, cell: Cell) -> bool:
         row, col = cell
         return self.map_data.grid[row][col] in FREE_SYMBOLS
+
+    def validate_generated_settings(self) -> None:
+        if len(self.action_goals) != self.action_goal_count:
+            raise ValueError(
+                "Generated action-goal count does not match the launch argument: "
+                f"expected {self.action_goal_count}, found {len(self.action_goals)}"
+            )
+
+        generated = self.scenario.get("generated_layout", {})
+        scenario_seed = generated.get("action_goal_seed")
+        if scenario_seed is not None and int(scenario_seed) != self.action_goal_seed:
+            raise ValueError(
+                "Generated action-goal seed does not match the launch argument: "
+                f"expected {self.action_goal_seed}, found {scenario_seed}"
+            )
 
     def validate_cell(self, cell: Cell, label: str) -> None:
         row, col = cell
@@ -324,8 +346,12 @@ class ExperimentManagerNode(Node):
                 marker_type=Marker.CUBE,
                 x=x,
                 y=y,
-                z=0.03,
-                scale=(0.18, 0.18, 0.06),
+                z=self.action_goal_height_m / 2.0 + 0.001,
+                scale=(
+                    self.action_goal_size_m,
+                    self.action_goal_size_m,
+                    self.action_goal_height_m,
+                ),
                 color=(1.0, 0.4, 0.0, 1.0),
             )
             marker_array.markers.append(marker)

@@ -197,8 +197,8 @@ def resolve_scenario_layout(
     layout = build_spawn_layout(
         grid=map_data["grid"],
         robot_ids=robot_ids,
-        checkpoint_count=action_goal_count,
-        random_seed=action_goal_seed,
+        action_goal_count=action_goal_count,
+        action_goal_seed=action_goal_seed,
     )
 
     for robot in enabled_robots:
@@ -210,7 +210,7 @@ def resolve_scenario_layout(
             "id": f"action_goal_{index + 1}",
             "cell": list(cell),
         }
-        for index, cell in enumerate(layout.checkpoint_cells)
+        for index, cell in enumerate(layout.action_goal_cells)
     ]
     resolved["generated_layout"] = {
         "map_name": map_name,
@@ -228,8 +228,12 @@ def generate_sdf_world(map_name, map_data, scenario, output_path):
     cell_size = float(visualization.get("cell_size_m", 0.5))
     wall_height = float(visualization.get("wall_height_m", 0.6))
     wall_z = float(visualization.get("wall_z_m", wall_height / 2.0))
-    checkpoint_size = float(visualization.get("checkpoint_size_m", 0.18))
-    checkpoint_height = float(visualization.get("checkpoint_height_m", 0.04))
+    action_goal_size = float(
+        visualization.get("action_goal_size_m", 0.18)
+    )
+    action_goal_height = float(
+        visualization.get("action_goal_height_m", 0.04)
+    )
 
     width = int(map_data["width"])
     height = int(map_data["height"])
@@ -288,15 +292,15 @@ def generate_sdf_world(map_name, map_data, scenario, output_path):
             diffuse_rgba="0.12 0.12 0.12 1",
         )
 
-    for checkpoint in scenario.get("action_goals", []):
-        row, col = (int(value) for value in checkpoint["cell"])
+    for action_goal in scenario.get("action_goals", []):
+        row, col = (int(value) for value in action_goal["cell"])
         x, y = cell_to_world(row, col, cell_size)
 
         append_box_model(
             parts=parts,
-            name=str(checkpoint["id"]),
-            pose_xyz_rpy=[x, y, checkpoint_height / 2.0 + 0.001, 0, 0, 0],
-            size_xyz=[checkpoint_size, checkpoint_size, checkpoint_height],
+            name=str(action_goal["id"]),
+            pose_xyz_rpy=[x, y, action_goal_height / 2.0 + 0.001, 0, 0, 0],
+            size_xyz=[action_goal_size, action_goal_size, action_goal_height],
             ambient_rgba="1.0 0.35 0.0 1",
             diffuse_rgba="1.0 0.45 0.0 1",
             static=True,
@@ -567,7 +571,7 @@ def generate_launch_description():
                 "action_goal_count",
                 default_value="8",
                 description=(
-                    "Number of spread-out action goals/checkpoints to generate"
+                    "Number of spread-out action goals to generate"
                 ),
             ),
             DeclareLaunchArgument(

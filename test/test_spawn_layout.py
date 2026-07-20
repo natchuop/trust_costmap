@@ -22,12 +22,12 @@ def test_layout_is_reproducible_unique_and_free():
         "........",
     ]
 
-    first = build_spawn_layout(grid, ["r1", "r2", "r3"], 6, random_seed=21)
-    second = build_spawn_layout(grid, ["r1", "r2", "r3"], 6, random_seed=21)
+    first = build_spawn_layout(grid, ["r1", "r2", "r3"], 6, action_goal_seed=21)
+    second = build_spawn_layout(grid, ["r1", "r2", "r3"], 6, action_goal_seed=21)
 
     assert first == second
 
-    all_cells = list(first.robot_cells.values()) + first.checkpoint_cells
+    all_cells = list(first.robot_cells.values()) + first.action_goal_cells
     assert len(all_cells) == len(set(all_cells))
     assert all(grid[row][col] in FREE_SYMBOLS for row, col in all_cells)
 
@@ -35,15 +35,15 @@ def test_layout_is_reproducible_unique_and_free():
 def test_goal_cells_do_not_change_when_robot_count_changes():
     grid = [".........." for _ in range(10)]
 
-    two_robots = build_spawn_layout(grid, ["r1", "r2"], 8, random_seed=21)
+    two_robots = build_spawn_layout(grid, ["r1", "r2"], 8, action_goal_seed=21)
     four_robots = build_spawn_layout(
         grid,
         ["r1", "r2", "r3", "r4"],
         8,
-        random_seed=21,
+        action_goal_seed=21,
     )
 
-    assert two_robots.checkpoint_cells == four_robots.checkpoint_cells
+    assert two_robots.action_goal_cells == four_robots.action_goal_cells
 
 
 def test_largest_connected_component_is_used():
@@ -69,4 +69,37 @@ def test_layout_rejects_map_without_enough_connected_space():
     grid = [".@."]
 
     with pytest.raises(ValueError, match="need 3, found 1"):
-        build_spawn_layout(grid, ["r1", "r2"], 1, random_seed=1)
+        build_spawn_layout(grid, ["r1", "r2"], 1, action_goal_seed=1)
+
+
+def test_action_goal_count_controls_exact_number_of_goals():
+    grid = ["............" for _ in range(12)]
+
+    layout = build_spawn_layout(
+        grid,
+        ["r1", "r2", "r3"],
+        action_goal_count=8,
+        action_goal_seed=21,
+    )
+
+    assert len(layout.action_goal_cells) == 8
+
+
+def test_action_goal_seed_changes_goal_and_robot_layout():
+    grid = ["............" for _ in range(12)]
+
+    seed_21 = build_spawn_layout(
+        grid,
+        ["r1", "r2", "r3"],
+        action_goal_count=8,
+        action_goal_seed=21,
+    )
+    seed_22 = build_spawn_layout(
+        grid,
+        ["r1", "r2", "r3"],
+        action_goal_count=8,
+        action_goal_seed=22,
+    )
+
+    assert seed_21.action_goal_cells != seed_22.action_goal_cells
+    assert seed_21.robot_cells != seed_22.robot_cells

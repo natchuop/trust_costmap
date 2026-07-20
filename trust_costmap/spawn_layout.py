@@ -10,7 +10,7 @@ Cell = Tuple[int, int]
 @dataclass(frozen=True)
 class SpawnLayout:
     robot_cells: Dict[str, Cell]
-    checkpoint_cells: List[Cell]
+    action_goal_cells: List[Cell]
     connected_free_cell_count: int
 
 
@@ -88,12 +88,12 @@ def choose_spread_cells(
 def build_spawn_layout(
     grid: Sequence[str],
     robot_ids: Sequence[str],
-    checkpoint_count: int,
-    random_seed: int,
+    action_goal_count: int,
+    action_goal_seed: int,
 ) -> SpawnLayout:
-    """Create one reproducible layout for robots and visual checkpoints."""
+    """Create one reproducible layout for robots and visual action goals."""
     component = largest_free_component(grid)
-    required_cells = len(robot_ids) + checkpoint_count
+    required_cells = len(robot_ids) + action_goal_count
 
     if not component:
         raise ValueError("The selected map contains no free cells.")
@@ -103,22 +103,22 @@ def build_spawn_layout(
             f"need {required_cells}, found {len(component)}."
         )
 
-    goal_rng = Random(random_seed)
-    checkpoint_cells = choose_spread_cells(
+    goal_rng = Random(action_goal_seed)
+    action_goal_cells = choose_spread_cells(
         component,
-        checkpoint_count,
+        action_goal_count,
         goal_rng,
     )
-    checkpoint_set = set(checkpoint_cells)
+    action_goal_set = set(action_goal_cells)
 
-    robot_candidates = [cell for cell in component if cell not in checkpoint_set]
-    robot_rng = Random(random_seed + 1)
+    robot_candidates = [cell for cell in component if cell not in action_goal_set]
+    robot_rng = Random(action_goal_seed + 1)
     robot_cells_list = robot_rng.sample(robot_candidates, k=len(robot_ids))
     robot_cells = dict(zip(robot_ids, robot_cells_list))
 
     return SpawnLayout(
         robot_cells=robot_cells,
-        checkpoint_cells=checkpoint_cells,
+        action_goal_cells=action_goal_cells,
         connected_free_cell_count=len(component),
     )
 
