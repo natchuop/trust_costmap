@@ -1,0 +1,29 @@
+Validation summary
+==================
+
+Completed in the packaging environment:
+
+- Python syntax compilation passed for:
+  - experiment.launch.py
+  - trust_costmap/spawn_layout.py
+  - trust_costmap/experiment_manager_node.py
+  - visualize_map.py
+  - setup.py
+- All 33 bundled MovingAI map files were parsed successfully.
+- For every bundled map, seed 21 produced:
+  - 3 unique robot cells
+  - 8 unique action-goal cells
+  - no occupied-cell placements
+- Spawn-layout unit tests: 5 passed.
+- Generated room-32-32-4 SDF parsed as valid XML.
+- Generated SDF contained:
+  - Physics, UserCommands, SceneBroadcaster, and Sensors systems
+  - 3 TurtleBot3 Burger model includes
+  - 8 static orange checkpoint visuals
+  - no collision geometry on checkpoints
+- worlds/mapf-map.zip passed an archive integrity test.
+
+Not available in this environment:
+
+- A complete ROS 2 / Gazebo runtime launch. Run colcon build and the documented
+  ros2 launch command in the target ROS 2 environment.

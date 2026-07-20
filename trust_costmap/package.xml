@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>trust_costmap</name>
-  <version>0.0.2</version>
+  <version>0.0.3</version>
   <description>Trust-weighted costmap experiments using ROS 2, Gazebo, TurtleBot3, and MovingAI maps.</description>
 
   <maintainer email="vboxuser@example.com">vboxuser</maintainer>

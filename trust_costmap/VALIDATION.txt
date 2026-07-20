@@ -1,0 +1,44 @@
+Final action-goal validation
+============================
+
+Supported launch arguments:
+- map_name
+- scenario_file
+- planner
+- allow_diagonal
+- bridge_robot_topics
+- action_goal_count
+- action_goal_seed
+
+Validated behavior:
+- action_goal_count=8 creates exactly 8 action goals.
+- action_goal_seed=21 reproduces the same goal and robot layout.
+- changing action_goal_seed from 21 to 22 changes both layouts.
+- all action goals and robot starts are unique free cells.
+- the largest connected free-space component is used.
+- action goals are spread using seeded farthest-point sampling.
+- generated Gazebo action goals are static orange visuals.
+- generated Gazebo action goals have no collision geometry.
+- all 33 bundled MovingAI maps passed placement validation with 8 goals and 3 robots.
+- the room-32-32-4 generated SDF parsed as valid XML and contained exactly 8 goals.
+- all launch arguments in the documented command are declared by experiment.launch.py.
+- Python syntax compilation passed.
+- spawn-layout unit tests: 7 passed.
+- action-goal terminology is used consistently in Python, YAML, README, and validation files.
+
+Exact supported command (Bash/Linux):
+
+ros2 launch trust_costmap experiment.launch.py \
+  map_name:=room-32-32-4 \
+  scenario_file:=scenario.yaml \
+  planner:=astar \
+  allow_diagonal:=false \
+  bridge_robot_topics:=true \
+  action_goal_count:=8 \
+  action_goal_seed:=21 \
+  --debug
+
+Runtime limitation:
+A complete ROS 2 and Gazebo launch could not be executed in the packaging environment
+because ROS 2 and Gazebo are not installed there. Pure Python placement, launch-helper,
+map, YAML, and generated-SDF behavior were validated.

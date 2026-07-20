@@ -7,7 +7,7 @@ package_name = "trust_costmap"
 
 setup(
     name=package_name,
-    version="0.0.2",
+    version="0.0.3",
     packages=[package_name],
     data_files=[
         (
@@ -33,7 +33,7 @@ setup(
     maintainer_email="vboxuser@example.com",
     description=(
         "Trust-weighted costmap experiments with randomized TurtleBot3 and "
-        "checkpoint placement."
+        "action-goal placement."
     ),
     license="MIT",
     tests_require=["pytest"],
