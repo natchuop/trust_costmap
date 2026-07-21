@@ -45,8 +45,8 @@ import yaml
 
 import rclpy
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import PoseStamped, Twist
-from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from geometry_msgs.msg import Point, PoseStamped, Twist
+from nav_msgs.msg import GridCells, OccupancyGrid, Odometry, Path
 from rclpy.node import Node
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
@@ -357,6 +357,14 @@ class ExperimentManagerNode(Node):
         }
 
         self.base_map_pub = self.create_publisher(OccupancyGrid, "/base_map", 10)
+        # RViz-only GridCells: OccupancyGrid Map plugin is broken on some VM GPUs
+        # (GLSL indexed_8bit_image). GridCells renders the same free/occupied floor.
+        self.rviz_base_free_pub = self.create_publisher(
+            GridCells, "/rviz_base_free", 10
+        )
+        self.rviz_base_occupied_pub = self.create_publisher(
+            GridCells, "/rviz_base_occupied", 10
+        )
         self.planning_costmap_pub = self.create_publisher(
             OccupancyGrid, "/planning_costmap", 10
         )
@@ -384,6 +392,17 @@ class ExperimentManagerNode(Node):
         self.cmd_vel_publishers: Dict[str, object] = {
             robot.robot_id: self.create_publisher(
                 Twist, f"/{robot.robot_id}/cmd_vel", 10
+            )
+            for robot in self.robots
+            if robot.enabled
+        }
+        # Read-only map-frame poses for LiDAR mapping and RViz.  Publishing
+        # these does not change navigation; it exposes the manager's existing
+        # authoritative pose, including kinematic-planar execution where wheel
+        # odometry is intentionally ignored.
+        self.robot_map_pose_publishers: Dict[str, object] = {
+            robot.robot_id: self.create_publisher(
+                PoseStamped, f"/{robot.robot_id}/map_pose", 10
             )
             for robot in self.robots
             if robot.enabled
@@ -759,6 +778,7 @@ class ExperimentManagerNode(Node):
             )
             self.robot_velocity[robot.robot_id] = (0.0, 0.0)
             self.robot_last_odom_time[robot.robot_id] = self.now_sec()
+            self.publish_robot_map_pose(robot.robot_id)
 
             self.get_logger().info(
                 f"Robot spawn pose: {robot.robot_id} -> "
@@ -1484,6 +1504,7 @@ class ExperimentManagerNode(Node):
             float(msg.twist.twist.angular.z),
         )
         self.robot_last_odom_time[robot_id] = self.now_sec()
+        self.publish_robot_map_pose(robot_id)
 
         # The constructor may create a temporary startup route from configured
         # start cells before Gazebo odometry arrives. Replace it once all enabled
@@ -1525,6 +1546,32 @@ class ExperimentManagerNode(Node):
     def quaternion_from_yaw(yaw: float) -> Tuple[float, float, float, float]:
         half = yaw * 0.5
         return 0.0, 0.0, math.sin(half), math.cos(half)
+
+    def publish_robot_map_pose(
+        self,
+        robot_id: str,
+        pose: Optional[Tuple[float, float, float]] = None,
+    ) -> None:
+        """Publish the manager's authoritative robot pose in the map frame."""
+
+        publisher = self.robot_map_pose_publishers.get(robot_id)
+        resolved_pose = pose or self.robot_pose.get(robot_id)
+        if publisher is None or resolved_pose is None:
+            return
+
+        x, y, yaw = resolved_pose
+        qx, qy, qz, qw = self.quaternion_from_yaw(yaw)
+        message = PoseStamped()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.frame_id = "map"
+        message.pose.position.x = float(x)
+        message.pose.position.y = float(y)
+        message.pose.position.z = 0.0
+        message.pose.orientation.x = qx
+        message.pose.orientation.y = qy
+        message.pose.orientation.z = qz
+        message.pose.orientation.w = qw
+        publisher.publish(message)
 
     def set_gazebo_model_pose(
         self,
@@ -2041,6 +2088,7 @@ class ExperimentManagerNode(Node):
             if reached_waypoint or now_sec - last_sync >= pose_sync_period:
                 if self.set_gazebo_model_pose(robot_id, next_pose):
                     self.robot_last_pose_sync_time[robot_id] = now_sec
+                self.publish_robot_map_pose(robot_id, next_pose)
 
             if reached_waypoint and waypoint_index + 1 >= len(route):
                 self.complete_robot_goal_if_reached(
@@ -3713,6 +3761,9 @@ class ExperimentManagerNode(Node):
         return length_cells * self.cell_size_m
 
     def publish_visual_debug(self) -> None:
+        for robot in self.robots:
+            if robot.enabled:
+                self.publish_robot_map_pose(robot.robot_id)
         self.publish_base_map()
         self.publish_robot_markers()
         self.publish_start_goal_markers()
@@ -3730,6 +3781,38 @@ class ExperimentManagerNode(Node):
             for col in range(self.map_data.width)
         ]
         self.base_map_pub.publish(message)
+        try:
+            self.publish_rviz_base_grid_cells()
+        except Exception as exc:
+            self.get_logger().warning(
+                f"RViz base GridCells publish failed (non-fatal): {exc}"
+            )
+
+    def publish_rviz_base_grid_cells(self) -> None:
+        """Publish MovingAI free/occupied cells for RViz without using Map displays."""
+
+        stamp = self.get_clock().now().to_msg()
+        free = GridCells()
+        free.header.stamp = stamp
+        free.header.frame_id = "map"
+        free.cell_width = self.cell_size_m
+        free.cell_height = self.cell_size_m
+        occupied = GridCells()
+        occupied.header = free.header
+        occupied.cell_width = self.cell_size_m
+        occupied.cell_height = self.cell_size_m
+
+        for row in range(self.map_data.height):
+            for col in range(self.map_data.width):
+                x, y = self.cell_to_world(row, col)
+                point = Point(x=x, y=y, z=0.01)
+                if self.is_blocked_cell(row, col):
+                    occupied.cells.append(Point(x=x, y=y, z=0.04))
+                else:
+                    free.cells.append(point)
+
+        self.rviz_base_free_pub.publish(free)
+        self.rviz_base_occupied_pub.publish(occupied)
 
     def publish_planning_costmap(self, cost_grid: CostGrid) -> None:
         message = self.make_grid_message()
@@ -4021,9 +4104,15 @@ class ExperimentManagerNode(Node):
         return marker_id + 1
 
     def destroy_node(self) -> bool:
-        for robot in (item for item in self.robots if item.enabled):
-            self.publish_zero_velocity(robot.robot_id)
-        self.finalize_metrics(reason="node_destroy")
+        try:
+            for robot in (item for item in self.robots if item.enabled):
+                try:
+                    self.publish_zero_velocity(robot.robot_id)
+                except Exception:
+                    pass
+            self.finalize_metrics(reason="node_destroy")
+        except Exception:
+            pass
         return super().destroy_node()
 
     # ------------------------------------------------------------------

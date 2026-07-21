@@ -374,6 +374,7 @@ def append_box_model(
             "          </geometry>",
             "        </collision>",
             '        <visual name="visual">',
+            "          <cast_shadows>false</cast_shadows>",
             "          <geometry>",
             "            <box>",
             f"              <size>{' '.join(str(value) for value in size_xyz)}</size>",
@@ -397,6 +398,38 @@ def set_xml_child_text(parent: ET.Element, tag: str, value: object) -> None:
     child.text = str(value)
 
 
+def simplify_turtlebot_visuals(model: ET.Element) -> None:
+    """Replace texture-heavy robot visuals with one primitive body.
+
+    Collision geometry, joints, sensors, and plugins remain untouched.  Only
+    render-only ``<visual>`` elements are removed, which avoids loading the
+    TurtleBot mesh and PBR texture assets in slow virtual machines.
+    """
+
+    links = model.findall("./link")
+    if not links:
+        return
+
+    for link in links:
+        for visual in list(link.findall("visual")):
+            link.remove(visual)
+
+    body_link = next(
+        (link for link in links if link.get("name", "") == "base_link"),
+        links[0],
+    )
+    visual = ET.SubElement(body_link, "visual", {"name": "low_graphics_body"})
+    set_xml_child_text(visual, "cast_shadows", "false")
+    set_xml_child_text(visual, "pose", "0 0 0 0 0 0")
+    geometry = ET.SubElement(visual, "geometry")
+    box = ET.SubElement(geometry, "box")
+    set_xml_child_text(box, "size", "0.18 0.14 0.10")
+    material = ET.SubElement(visual, "material")
+    set_xml_child_text(material, "ambient", "0.20 0.42 0.82 1")
+    set_xml_child_text(material, "diffuse", "0.20 0.42 0.82 1")
+    set_xml_child_text(material, "specular", "0 0 0 1")
+
+
 def append_namespaced_turtlebot3_burger(
     parts: List[str],
     model_file: Path,
@@ -404,6 +437,7 @@ def append_namespaced_turtlebot3_burger(
     x: float,
     y: float,
     yaw: float = 0.0,
+    low_graphics: bool = True,
 ) -> None:
     tree = ET.parse(model_file)
     root = tree.getroot()
@@ -436,6 +470,9 @@ def append_namespaced_turtlebot3_burger(
         set_xml_child_text(plugin, "odom_topic", f"/model/{name}/odometry")
         set_xml_child_text(plugin, "tf_topic", f"/model/{name}/tf")
 
+    if low_graphics:
+        simplify_turtlebot_visuals(model)
+
     ET.indent(model, space="  ", level=2)
     parts.extend(ET.tostring(model, encoding="unicode").splitlines())
 
@@ -461,6 +498,7 @@ def generate_sdf_world(
     scenario: Dict[str, Any],
     turtlebot3_model_file: Path,
     output_path: Path,
+    low_graphics: bool = True,
 ) -> None:
     visualization = scenario.get("visualization", {})
     cell_size = float(visualization.get("cell_size_m", 0.5))
@@ -481,11 +519,19 @@ def generate_sdf_world(
         '    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>',
         '    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>',
         '    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>',
+        "    <scene>",
+        "      <ambient>0.65 0.65 0.65 1</ambient>",
+        "      <background>0.16 0.17 0.19 1</background>",
+        # Shadows stay off even with full TurtleBot meshes; they are expensive in VMs
+        # and do not affect LiDAR, collisions, or navigation.
+        "      <shadows>false</shadows>",
+        "      <grid>false</grid>",
+        "    </scene>",
         '    <light type="directional" name="sun">',
-        "      <cast_shadows>true</cast_shadows>",
+        "      <cast_shadows>false</cast_shadows>",
         f"      <pose>{world_width / 2.0} {world_height / 2.0} 10 0 0 0</pose>",
-        "      <diffuse>0.8 0.8 0.8 1</diffuse>",
-        "      <specular>0.2 0.2 0.2 1</specular>",
+        "      <diffuse>0.72 0.72 0.72 1</diffuse>",
+        "      <specular>0 0 0 1</specular>",
         "      <direction>-0.5 0.1 -0.9</direction>",
         "    </light>",
     ]
@@ -518,7 +564,13 @@ def generate_sdf_world(
         x, y = cell_to_world(row, col, cell_size)
         yaw = float(robot.get("start_yaw", robot.get("yaw", 0.0)))
         append_namespaced_turtlebot3_burger(
-            parts, turtlebot3_model_file, robot_id, x, y, yaw
+            parts,
+            turtlebot3_model_file,
+            robot_id,
+            x,
+            y,
+            yaw,
+            low_graphics=low_graphics,
         )
 
     parts.extend(["  </world>", "</sdf>"])
@@ -696,6 +748,170 @@ def make_bridge_actions(
     return actions
 
 
+def select_rviz_robot_id(scenario: Dict[str, Any], requested: str) -> str:
+    """Resolve ``auto`` to the first enabled benign robot."""
+
+    robots = enabled_robots(scenario)
+    requested_clean = str(requested).strip()
+    valid_ids = [str(robot["id"]) for robot in robots]
+
+    if requested_clean and requested_clean.lower() not in {"auto", "default"}:
+        if requested_clean not in valid_ids:
+            raise RuntimeError(
+                f"rviz_robot_id={requested_clean!r} is not enabled. "
+                f"Choose one of: {', '.join(valid_ids)}"
+            )
+        return requested_clean
+
+    for robot in robots:
+        robot_id = str(robot["id"])
+        role = str(robot.get("role", ""))
+        if "benign" in robot_id.lower() or "benign" in role.lower():
+            return robot_id
+    return valid_ids[0]
+
+
+def make_peer_scan_display_yaml(peer_robot_ids: Sequence[str]) -> str:
+    """Build extra LaserScan display blocks for peer robots (reference-style)."""
+
+    # Distinct colors so overlapping shared LiDAR rays stay readable in one window.
+    palette = (
+        (0, 170, 255),
+        (120, 255, 80),
+        (255, 120, 255),
+        (255, 200, 40),
+        (80, 220, 200),
+    )
+    blocks: List[str] = []
+    for index, peer_id in enumerate(peer_robot_ids):
+        red, green, blue = palette[index % len(palette)]
+        blocks.append(
+            "\n".join(
+                [
+                    "        - Alpha: 1",
+                    "          Autocompute Intensity Bounds: true",
+                    "          Autocompute Value Bounds:",
+                    "            Max Value: 10",
+                    "            Min Value: -10",
+                    "            Value: true",
+                    "          Axis: Z",
+                    "          Channel Name: intensity",
+                    "          Class: rviz_default_plugins/LaserScan",
+                    f"          Color: {red}; {green}; {blue}",
+                    "          Color Transformer: FlatColor",
+                    "          Decay Time: 0.25",
+                    "          Enabled: true",
+                    "          Invert Rainbow: false",
+                    "          Max Color: 255; 255; 255",
+                    "          Max Intensity: 4096",
+                    "          Min Color: 0; 0; 0",
+                    "          Min Intensity: 0",
+                    f"          Name: Peer Scan {peer_id}",
+                    "          Position Transformer: XYZ",
+                    "          Selectable: true",
+                    "          Size (Pixels): 4",
+                    "          Size (m): 0.035",
+                    "          Style: FlatSquares",
+                    "          Topic:",
+                    "            Depth: 5",
+                    "            Durability Policy: Volatile",
+                    "            History Policy: Keep Last",
+                    "            Reliability Policy: Reliable",
+                    f"            Value: /{peer_id}/scan_rviz",
+                    "          Use Fixed Frame: true",
+                    "          Use rainbow: false",
+                    "          Value: true",
+                ]
+            )
+        )
+    if not blocks:
+        return ""
+    return "\n" + "\n".join(blocks) + "\n"
+
+
+def render_rviz_config(
+    package_share: Path,
+    output_path: Path,
+    robot_id: str,
+    peer_robot_ids: Optional[Sequence[str]] = None,
+) -> None:
+    template_path = package_share / "config" / "lidar_mapping.rviz.in"
+    if not template_path.exists():
+        raise RuntimeError(f"RViz template not found: {template_path}")
+    peers = [
+        str(peer)
+        for peer in (peer_robot_ids or [])
+        if str(peer) and str(peer) != robot_id
+    ]
+    rendered = (
+        template_path.read_text(encoding="utf-8")
+        .replace("__ROBOT_ID__", robot_id)
+        .replace("__PEER_SCAN_DISPLAYS__", make_peer_scan_display_yaml(peers))
+    )
+    if "__ROBOT_ID__" in rendered or "__PEER_SCAN_DISPLAYS__" in rendered:
+        raise RuntimeError("RViz template still contains unresolved placeholders.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(rendered, encoding="utf-8")
+
+
+def make_lidar_mapping_actions(
+    scenario: Dict[str, Any],
+    map_data: Dict[str, Any],
+    publish_rate_hz: float,
+    scan_stride: int,
+    rviz_robot_id: str,
+    rviz_outputs_enabled: bool,
+) -> List[Node]:
+    """Launch one isolated mapper for every enabled scenario robot."""
+
+    robots = enabled_robots(scenario)
+    robot_ids = [str(robot["id"]) for robot in robots]
+    visualization = scenario.get("visualization", {})
+    resolution = float(visualization.get("cell_size_m", 0.5))
+
+    actions: List[Node] = []
+    for robot in robots:
+        robot_id = str(robot["id"])
+        row, col = (int(value) for value in robot["start_cell"])
+        spawn_x, spawn_y = cell_to_world(row, col, resolution)
+        spawn_yaw = float(robot.get("start_yaw", robot.get("yaw", 0.0)))
+        actions.append(
+            Node(
+                package=PACKAGE_NAME,
+                executable="lidar_mapper",
+                namespace=robot_id,
+                name="lidar_mapper",
+                output="screen",
+                parameters=[
+                    {
+                        "robot_id": robot_id,
+                        # An explicit empty-string sentinel keeps the ROS parameter
+                        # type stable when a scenario contains only one enabled robot.
+                        "peer_robot_ids": (
+                            [peer_id for peer_id in robot_ids if peer_id != robot_id]
+                            or [""]
+                        ),
+                        "map_width": int(map_data["width"]),
+                        "map_height": int(map_data["height"]),
+                        "resolution": resolution,
+                        "spawn_x": spawn_x,
+                        "spawn_y": spawn_y,
+                        "spawn_yaw": spawn_yaw,
+                        "scan_topic": f"/{robot_id}/scan",
+                        "odom_topic": f"/{robot_id}/odom",
+                        "map_pose_topic": f"/{robot_id}/map_pose",
+                        "publish_rate_hz": float(publish_rate_hz),
+                        "scan_stride": int(scan_stride),
+                        "enable_rviz_outputs": bool(
+                            rviz_outputs_enabled and robot_id == rviz_robot_id
+                        ),
+                    }
+                ],
+            )
+        )
+    return actions
+
+
 def rosbag_topics(scenario: Dict[str, Any]) -> List[str]:
     topics = [
         "/base_map",
@@ -718,9 +934,23 @@ def rosbag_topics(scenario: Dict[str, Any]) -> List[str]:
                 f"/{robot_id}/odom",
                 f"/{robot_id}/cmd_vel",
                 f"/{robot_id}/scan",
+                f"/{robot_id}/scan_rviz",
+                f"/{robot_id}/map_pose",
+                f"/{robot_id}/current_observation_map",
+                f"/{robot_id}/local_map",
+                f"/{robot_id}/shared_map",
+                f"/{robot_id}/combined_map",
+                f"/{robot_id}/combined_probability_markers",
+                f"/{robot_id}/local_history_markers",
+                f"/{robot_id}/shared_history_markers",
+                f"/{robot_id}/current_observation_markers",
+                f"/{robot_id}/footprint_markers",
+                f"/{robot_id}/lidar_free_cells",
+                f"/{robot_id}/lidar_occupied_cells",
                 f"/agent_routes/{robot_id}",
             ]
         )
+    topics.extend(["/rviz_base_free", "/rviz_base_occupied"])
     return list(dict.fromkeys(topics))
 
 
@@ -755,6 +985,7 @@ def prepare_experiment(context: Any) -> List[Any]:
     allow_diagonal = value("allow_diagonal")
     replan_period_sec = value("replan_period_sec")
     duration_override = value("experiment_duration_sec")
+    gazebo_low_graphics = parse_bool(value("gazebo_low_graphics"))
 
     map_path = package_share / "worlds" / "movingai_mapf" / f"{map_name}.map"
     scenario_path = resolve_path(package_share, scenario_file)
@@ -803,7 +1034,14 @@ def prepare_experiment(context: Any) -> List[Any]:
 
     world_path = world_dir / f"generated_{sanitize_identifier(map_name)}.sdf"
     models_dir, model_file = get_turtlebot3_model_paths()
-    generate_sdf_world(map_name, map_data, scenario, model_file, world_path)
+    generate_sdf_world(
+        map_name,
+        map_data,
+        scenario,
+        model_file,
+        world_path,
+        low_graphics=gazebo_low_graphics,
+    )
 
     attack_is_enabled = attack_enabled(scenario)
     requested_generation = parse_auto_bool(
@@ -897,6 +1135,30 @@ def prepare_experiment(context: Any) -> List[Any]:
     bridge_enabled = parse_bool(value("bridge_robot_topics"))
     headless = parse_bool(value("headless"))
     record_bag = parse_bool(value("record_rosbag"))
+    lidar_mapping_enabled = parse_bool(value("enable_lidar_mapping"))
+    rviz_enabled = parse_auto_bool(
+        value("enable_rviz"),
+        automatic_value=lidar_mapping_enabled and not headless,
+    )
+    if headless and rviz_enabled:
+        raise RuntimeError(
+            "enable_rviz=true cannot be used with headless=true. "
+            "Use enable_rviz=false or enable_rviz=auto."
+        )
+    rviz_robot_id = select_rviz_robot_id(scenario, value("rviz_robot_id"))
+    rviz_config_path = metadata_dir / f"rviz_{sanitize_identifier(rviz_robot_id)}.rviz"
+    if rviz_enabled:
+        peer_ids = [
+            str(robot["id"])
+            for robot in enabled_robots(scenario)
+            if str(robot["id"]) != rviz_robot_id
+        ]
+        render_rviz_config(
+            package_share,
+            rviz_config_path,
+            rviz_robot_id,
+            peer_robot_ids=peer_ids,
+        )
 
     manifest = {
         "schema_version": 1,
@@ -947,6 +1209,13 @@ def prepare_experiment(context: Any) -> List[Any]:
             "logs_directory": str(logs_dir),
             "headless": headless,
             "bridges_enabled": bridge_enabled,
+            "gazebo_low_graphics": gazebo_low_graphics,
+            "lidar_mapping_enabled": lidar_mapping_enabled,
+            "rviz_enabled": rviz_enabled,
+            "rviz_robot_id": rviz_robot_id,
+            "rviz_config": str(rviz_config_path) if rviz_enabled else "",
+            "mapping_publish_rate_hz": float(value("mapping_publish_rate_hz")),
+            "mapping_scan_stride": int(value("mapping_scan_stride")),
         },
         "future_metrics_contract": {
             "expected_summary_file": str(run_dir / "metrics" / "summary.json"),
@@ -1023,6 +1292,9 @@ def prepare_experiment(context: Any) -> List[Any]:
         LogInfo(msg=f"[trust_costmap] method={method}, seed={experiment_seed}, trial={trial_index}"),
         LogInfo(msg=f"[trust_costmap] attack_enabled={attack_is_enabled}"),
         LogInfo(msg=f"[trust_costmap] manifest={manifest_path}"),
+        LogInfo(msg=f"[trust_costmap] gazebo_low_graphics={gazebo_low_graphics}"),
+        LogInfo(msg=f"[trust_costmap] lidar_mapping_enabled={lidar_mapping_enabled}"),
+        LogInfo(msg=f"[trust_costmap] rviz_enabled={rviz_enabled}, rviz_robot_id={rviz_robot_id}"),
         gazebo,
     ]
 
@@ -1037,6 +1309,47 @@ def prepare_experiment(context: Any) -> List[Any]:
             period=float(value("manager_start_delay_sec")), actions=[manager]
         )
     )
+
+    if lidar_mapping_enabled:
+        mapping_actions = make_lidar_mapping_actions(
+            scenario,
+            map_data,
+            publish_rate_hz=float(value("mapping_publish_rate_hz")),
+            scan_stride=int(value("mapping_scan_stride")),
+            rviz_robot_id=rviz_robot_id,
+            rviz_outputs_enabled=rviz_enabled,
+        )
+        actions.append(
+            TimerAction(
+                period=float(value("mapping_start_delay_sec")),
+                actions=mapping_actions,
+            )
+        )
+        if not bridge_enabled:
+            actions.append(
+                LogInfo(
+                    msg=(
+                        "[trust_costmap] WARNING: LiDAR mapping is enabled while "
+                        "bridge_robot_topics=false; external scan/odom publishers "
+                        "must provide the robot topics."
+                    )
+                )
+            )
+
+    if rviz_enabled:
+        rviz = Node(
+            package="rviz2",
+            executable="rviz2",
+            name="trust_costmap_rviz",
+            output="screen",
+            arguments=["-d", str(rviz_config_path)],
+        )
+        actions.append(
+            TimerAction(
+                period=float(value("rviz_start_delay_sec")),
+                actions=[rviz],
+            )
+        )
 
     if record_bag:
         bag_command = [
@@ -1198,6 +1511,41 @@ def generate_launch_description() -> LaunchDescription:
             description="Delay before starting the experiment manager.",
         ),
         DeclareLaunchArgument(
+            "enable_lidar_mapping",
+            default_value="true",
+            description="Launch one visualization-only LiDAR mapper per enabled robot.",
+        ),
+        DeclareLaunchArgument(
+            "mapping_start_delay_sec",
+            default_value="3.25",
+            description="Delay before starting per-robot LiDAR mapping nodes.",
+        ),
+        DeclareLaunchArgument(
+            "mapping_publish_rate_hz",
+            default_value="2.0",
+            description="Persistent/shared occupancy publication rate per robot.",
+        ),
+        DeclareLaunchArgument(
+            "mapping_scan_stride",
+            default_value="1",
+            description="Process every Nth LiDAR beam; increase to reduce CPU load.",
+        ),
+        DeclareLaunchArgument(
+            "enable_rviz",
+            default_value="auto",
+            description="true, false, or auto; auto opens one window unless headless.",
+        ),
+        DeclareLaunchArgument(
+            "rviz_robot_id",
+            default_value="auto",
+            description="Robot displayed by the single RViz window; auto selects a benign robot.",
+        ),
+        DeclareLaunchArgument(
+            "rviz_start_delay_sec",
+            default_value="4.0",
+            description="Delay before opening the single RViz window.",
+        ),
+        DeclareLaunchArgument(
             "headless",
             default_value="false",
             description="Run Gazebo server-only for automated baseline sweeps.",
@@ -1206,6 +1554,11 @@ def generate_launch_description() -> LaunchDescription:
             "gz_verbosity",
             default_value="1",
             description="Gazebo verbosity passed to gz sim -v.",
+        ),
+        DeclareLaunchArgument(
+            "gazebo_low_graphics",
+            default_value="true",
+            description="Disable shadows and PBR textures while retaining robots, routes, and goals.",
         ),
         DeclareLaunchArgument(
             "action_goal_count",
