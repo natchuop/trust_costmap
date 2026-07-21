@@ -307,7 +307,9 @@ execution:
   maximum_step_sec: 0.10
 
   # Keep robot motion responsive without pushing pose updates at render rate.
-  gazebo_pose_rate_hz: 8.0
+  # Pose updates use a Gazebo service subprocess, so avoid calling it at
+  # render rate in a VM.
+  gazebo_pose_rate_hz: 10.0
 
   deterministic: true
   pause_motion_until_visual_sync: false
