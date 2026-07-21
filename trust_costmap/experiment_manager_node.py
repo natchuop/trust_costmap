@@ -2912,15 +2912,7 @@ class ExperimentManagerNode(Node):
         )
 
     def sync_malicious_object_visuals(self) -> None:
-        if not bool(self.gazebo_visualization_config.get("enabled", True)):
-            return
-        if not bool(self.gazebo_visualization_config.get("show_malicious_objects", True)):
-            return
-        show_malicious = self.malicious_attack_config.get(
-            "show_gazebo_visuals",
-            self.malicious_attack_config.get("show_visuals", True),
-        )
-        if not bool(show_malicious):
+        if not bool(self.malicious_attack_config.get("show_gazebo_visuals", True)):
             return
         if self.malicious_visual_sync_in_progress:
             return
@@ -4556,3 +4548,4 @@ def main(args=None) -> None:
 
 if __name__ == "__main__":
     main()
+

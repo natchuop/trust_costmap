@@ -224,7 +224,6 @@ malicious_attack:
 
   # Gazebo visualization of malicious occupied cells.
   show_visuals: true
-  show_gazebo_visuals: true
   visual_shape: cylinder
   visual_radius_m: 0.15
   visual_height_m: 0.12
@@ -306,13 +305,11 @@ execution:
   # Allow a larger movement step when callbacks are delayed.
   maximum_step_sec: 0.10
 
-  # Keep robot motion responsive without pushing pose updates at render rate.
-  # Pose updates use a Gazebo service subprocess, so avoid calling it at
-  # render rate in a VM.
+  # Synchronize the visible Gazebo pose ten times per second.
   gazebo_pose_rate_hz: 10.0
 
   deterministic: true
-  pause_motion_until_visual_sync: false
+  pause_motion_until_visual_sync: true
 
 control:
   enabled: true
