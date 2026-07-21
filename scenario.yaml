@@ -223,8 +223,8 @@ malicious_attack:
   physical_collision: false
 
   # Gazebo visualization of malicious occupied cells.
-  show_visuals: false
-  show_gazebo_visuals: false
+  show_visuals: true
+  show_gazebo_visuals: true
   visual_shape: cylinder
   visual_radius_m: 0.15
   visual_height_m: 0.12
@@ -306,11 +306,11 @@ execution:
   # Allow a larger movement step when callbacks are delayed.
   maximum_step_sec: 0.10
 
-  # Lowering pose sync reduces VM overhead from visualization-only updates.
-  gazebo_pose_rate_hz: 4.0
+  # Keep robot motion responsive without pushing pose updates at render rate.
+  gazebo_pose_rate_hz: 8.0
 
   deterministic: true
-  pause_motion_until_visual_sync: true
+  pause_motion_until_visual_sync: false
 
 control:
   enabled: true
@@ -415,10 +415,10 @@ action_goals:
 # Gazebo visualization
 # -----------------------------------------------------------------------------
 gazebo_visualization:
-  enabled: false
-  show_action_goals: false
-  show_routes: false
-  show_malicious_objects: false
+  enabled: true
+  show_action_goals: true
+  show_routes: true
+  show_malicious_objects: true
   debug_services: false
 
   route_width_m: 0.20
