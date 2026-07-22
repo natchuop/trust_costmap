@@ -196,6 +196,13 @@ def main() -> None:
             robot_model = models[str(robot["id"])]
             assert robot_model.find(".//sensor") is not None
             assert robot_model.find(".//plugin") is not None
+            sensor = robot_model.find(".//sensor")
+            assert sensor is not None
+            assert sensor.get("type") == "gpu_lidar"
+            assert sensor.findtext("update_rate") == "2"
+            samples = sensor.findtext("./lidar/scan/horizontal/samples")
+            if samples is not None:
+                assert samples == "72"
             visuals = robot_model.findall(".//visual")
             assert len(visuals) == 1
             assert visuals[0].get("name") == "low_graphics_body"

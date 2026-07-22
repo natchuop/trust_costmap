@@ -331,9 +331,17 @@ def effective_costmap_method(
 def effective_duration_sec(
     scenario: Dict[str, Any], duration_override: str
 ) -> float:
+    """Resolve experiment duration.
+
+    - override > 0: use that many seconds
+    - override < 0: disable timed shutdown (run until Ctrl+C / manager exit policy)
+    - override == 0: use scenario ``experiment.duration_sec``
+    """
     override = float(duration_override)
     if override > 0.0:
         return override
+    if override < 0.0:
+        return 0.0
     return max(0.0, float(scenario.get("experiment", {}).get("duration_sec", 0.0)))
 
 
@@ -401,9 +409,9 @@ def set_xml_child_text(parent: ET.Element, tag: str, value: object) -> None:
 def simplify_turtlebot_visuals(model: ET.Element) -> None:
     """Replace texture-heavy robot visuals with one primitive body.
 
-    Collision geometry, joints, sensors, and plugins remain untouched.  Only
-    render-only ``<visual>`` elements are removed, which avoids loading the
-    TurtleBot mesh and PBR texture assets in slow virtual machines.
+    Collision geometry, joints, sensors, and plugins remain. Render-only
+    ``<visual>`` meshes are removed for slow VMs. GPU LiDAR stays as
+    ``gpu_lidar`` (Gazebo Sim 8 has no CPU lidar) but is downsampled.
     """
 
     links = model.findall("./link")
@@ -413,6 +421,19 @@ def simplify_turtlebot_visuals(model: ET.Element) -> None:
     for link in links:
         for visual in list(link.findall("visual")):
             link.remove(visual)
+
+    for sensor in model.findall(".//sensor"):
+        # Gazebo Sim 8 does not support CPU type="lidar" yet; keep gpu_lidar and
+        # shrink the workload so software rendering on VMs can publish scans.
+        if sensor.get("type") == "gpu_lidar":
+            set_xml_child_text(sensor, "visualize", "false")
+            set_xml_child_text(sensor, "update_rate", "2")
+            horizontal = sensor.find("./lidar/scan/horizontal")
+            if horizontal is not None:
+                set_xml_child_text(horizontal, "samples", "72")
+                set_xml_child_text(horizontal, "resolution", "1")
+                set_xml_child_text(horizontal, "min_angle", "0")
+                set_xml_child_text(horizontal, "max_angle", "6.283185")
 
     body_link = next(
         (link for link in links if link.get("name", "") == "base_link"),
@@ -470,6 +491,12 @@ def append_namespaced_turtlebot3_burger(
         set_xml_child_text(plugin, "odom_topic", f"/model/{name}/odometry")
         set_xml_child_text(plugin, "tf_topic", f"/model/{name}/tf")
 
+    # Headless Sensors publishes relative <topic>scan</topic> as a shared /scan.
+    # Give each robot a unique absolute topic matching the ros_gz bridge.
+    for sensor in model.findall(".//sensor"):
+        if sensor.get("type") == "gpu_lidar" or sensor.get("name") == "hls_lfcd_lds":
+            set_xml_child_text(sensor, "topic", f"/model/{name}/scan")
+
     if low_graphics:
         simplify_turtlebot_visuals(model)
 
@@ -499,6 +526,7 @@ def generate_sdf_world(
     turtlebot3_model_file: Path,
     output_path: Path,
     low_graphics: bool = True,
+    headless: bool = False,
 ) -> None:
     visualization = scenario.get("visualization", {})
     cell_size = float(visualization.get("cell_size_m", 0.5))
@@ -519,6 +547,18 @@ def generate_sdf_world(
         '    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>',
         '    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>',
         '    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>',
+    ]
+    # Always host Sensors in-world. Relying only on the GUI Sensors host fails on
+    # VMware/software GL, which leaves /scan silent while map-raycast still works.
+    parts.extend(
+        [
+            '    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">',
+            '      <render_engine>ogre</render_engine>',
+            '    </plugin>',
+        ]
+    )
+    parts.extend(
+        [
         "    <scene>",
         "      <ambient>0.65 0.65 0.65 1</ambient>",
         "      <background>0.16 0.17 0.19 1</background>",
@@ -534,7 +574,8 @@ def generate_sdf_world(
         "      <specular>0 0 0 1</specular>",
         "      <direction>-0.5 0.1 -0.9</direction>",
         "    </light>",
-    ]
+        ]
+    )
 
     append_box_model(
         parts,
@@ -719,14 +760,10 @@ def make_bridge_actions(
     if not enabled:
         return []
 
-    world_name = make_world_name(map_name)
     actions: List[Node] = []
     for robot in enabled_robots(scenario):
         robot_id = str(robot["id"])
-        scan_topic = (
-            f"/world/{world_name}/model/{robot_id}/link/base_scan/"
-            "sensor/hls_lfcd_lds/scan"
-        )
+        scan_topic = f"/model/{robot_id}/scan"
         actions.append(
             Node(
                 package="ros_gz_bridge",
@@ -957,7 +994,9 @@ def rosbag_topics(scenario: Dict[str, Any]) -> List[str]:
 def build_gazebo_command(world_path: Path, headless: bool, verbosity: str) -> List[str]:
     command = ["gz", "sim", "-r", "-v", verbosity]
     if headless:
-        command.append("-s")
+        # Server-only plus EGL/OSMesa rendering so CPU/GPU lidar can publish
+        # without a Gazebo GUI window (required on VMs for scan data).
+        command.extend(["-s", "--headless-rendering", "--render-engine", "ogre"])
     else:
         command.extend(["--render-engine", "ogre"])
     command.append(str(world_path))
@@ -986,6 +1025,7 @@ def prepare_experiment(context: Any) -> List[Any]:
     replan_period_sec = value("replan_period_sec")
     duration_override = value("experiment_duration_sec")
     gazebo_low_graphics = parse_bool(value("gazebo_low_graphics"))
+    headless = parse_bool(value("headless"))
 
     map_path = package_share / "worlds" / "movingai_mapf" / f"{map_name}.map"
     scenario_path = resolve_path(package_share, scenario_file)
@@ -1041,6 +1081,7 @@ def prepare_experiment(context: Any) -> List[Any]:
         model_file,
         world_path,
         low_graphics=gazebo_low_graphics,
+        headless=headless,
     )
 
     attack_is_enabled = attack_enabled(scenario)
@@ -1133,7 +1174,6 @@ def prepare_experiment(context: Any) -> List[Any]:
         )
 
     bridge_enabled = parse_bool(value("bridge_robot_topics"))
-    headless = parse_bool(value("headless"))
     record_bag = parse_bool(value("record_rosbag"))
     lidar_mapping_enabled = parse_bool(value("enable_lidar_mapping"))
     rviz_enabled = parse_auto_bool(
@@ -1478,7 +1518,10 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             "experiment_duration_sec",
             default_value="0.0",
-            description="Duration override; <=0 uses experiment.duration_sec from YAML.",
+            description=(
+                "Duration override. >0 overrides YAML; 0 uses YAML "
+                "experiment.duration_sec; <0 disables timed shutdown."
+            ),
         ),
         DeclareLaunchArgument(
             "shutdown_grace_sec",

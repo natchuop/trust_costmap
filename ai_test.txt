@@ -1,0 +1,269 @@
+You are testing and debugging a ROS 2 Jazzy package named trust_costmap on an Ubuntu VM.
+
+FIRST, APPLY THE PROVIDED UPDATE BUNDLE
+- Preserve the user's current work. Run `git status --short` and save it to `/tmp/trust_costmap_pre_update_status.txt`.
+- Locate the extracted directory containing `apply_update.py`. Do not clone over or delete the user's existing checkout.
+- Apply the update with:
+
+  python3 /path/to/trust_costmap_rviz_update/apply_update.py ~/ros_ws/src/trust_costmap
+
+- Existing replaced files receive one-time `.pre_shared_lidar_backup` copies. Inspect the diff before making additional changes:
+
+  cd ~/ros_ws/src/trust_costmap
+  git status --short
+  git diff -- setup.py package.xml trust_costmap/lidar_mapping_node.py rviz_shared_mapping.launch.py config/lidar_mapping.rviz scripts/run_shared_lidar_rviz.sh
+
+GOAL
+Confirm that the new RViz display is built only from accumulated LiDAR observations shared across all enabled robots. It must NOT display the full static MovingAI map. RViz should begin mostly empty, then reveal observed free cells in blue and increasingly occupied cells in violet/dark purple. Unknown cells must remain absent. Live LiDAR obstacle-hit endpoints and square footprints for all robots should be visible.
+
+SAFETY / SCOPE
+- Do not connect the LiDAR map to /planning_costmap.
+- Do not change /base_map, /map_claims, /trust_updates, /planned_path, or cmd_vel behavior.
+- Include genuine LiDAR data from benign and malicious robots.
+- Exclude fabricated attack claims from the LiDAR visualization.
+- Preserve existing navigation, planning, trust, and attack experiment behavior.
+- Prefer gazebo_low_graphics:=true while debugging on the VM.
+- Do not use the RViz OccupancyGrid Map display if it produces the known GLSL indexed_8bit_image shader error. The intended visualization uses MarkerArray.
+
+EXPECTED NEW FILES
+- trust_costmap/lidar_mapping_node.py
+- trust_costmap/shared_mapping_utils.py
+- rviz_shared_mapping.launch.py
+- config/lidar_mapping.rviz
+- scripts/run_shared_lidar_rviz.sh
+- scripts/check_shared_mapping.py
+- test/test_shared_mapping_utils.py
+
+EXPECTED TOPICS
+- /shared_lidar/probability_markers
+- /shared_lidar/scan_endpoints
+- /shared_lidar/robot_footprints
+- /<robot>/current_observation_map
+- /<robot>/local_map
+- /<robot>/shared_map
+- /<robot>/combined_map
+
+SETUP AND STATIC CHECKS
+1. Open a terminal and run:
+
+   cd ~/ros_ws
+   set +u
+   source /opt/ros/jazzy/setup.bash
+   python3 -m py_compile \
+     src/trust_costmap/trust_costmap/shared_mapping_utils.py \
+     src/trust_costmap/trust_costmap/lidar_mapping_node.py \
+     src/trust_costmap/rviz_shared_mapping.launch.py
+
+2. Run unit tests:
+
+   cd ~/ros_ws
+   set +u
+   source /opt/ros/jazzy/setup.bash
+   python3 -m pytest -q src/trust_costmap/test/test_shared_mapping_utils.py
+
+3. Build:
+
+   cd ~/ros_ws
+   set +u
+   source /opt/ros/jazzy/setup.bash
+   rm -rf build/trust_costmap install/trust_costmap log/latest_build 2>/dev/null || true
+   colcon build --packages-select trust_costmap --symlink-install --event-handlers console_direct+
+   source install/setup.bash
+
+4. Confirm entry points and installed data:
+
+   ros2 pkg executables trust_costmap | grep -E 'experiment_manager|lidar_mapper'
+   PKG_SHARE="$(ros2 pkg prefix trust_costmap)/share/trust_costmap"
+   test -f "$PKG_SHARE/rviz_shared_mapping.launch.py"
+   test -f "$PKG_SHARE/config/lidar_mapping.rviz"
+   ros2 launch trust_costmap rviz_shared_mapping.launch.py --show-args
+
+RUN THE PROGRAM
+5. Start the experiment in a dedicated terminal and tee output to a log:
+
+   cd ~/ros_ws
+   set +u
+   source /opt/ros/jazzy/setup.bash
+   source install/setup.bash
+   mkdir -p /tmp/trust_costmap_test
+   ros2 launch trust_costmap rviz_shared_mapping.launch.py \
+     map_name:=room-32-32-4 \
+     scenario_file:=scenario.yaml \
+     bridge_robot_topics:=true \
+     enable_lidar_mapping:=true \
+     enable_rviz:=true \
+     mapping_resolution_m:=0.10 \
+     mapping_publish_rate_hz:=2.0 \
+     max_mapping_range_m:=3.5 \
+     gazebo_low_graphics:=true \
+     2>&1 | tee /tmp/trust_costmap_test/launch.log
+
+6. Leave the launch running. In a second terminal:
+
+   cd ~/ros_ws
+   set +u
+   source /opt/ros/jazzy/setup.bash
+   source install/setup.bash
+
+   ros2 node list
+   ros2 topic list | sort | grep -E 'shared_lidar|current_observation_map|local_map|shared_map|combined_map|/scan$|/odom$|map_pose'
+
+   ros2 topic info -v /shared_lidar/probability_markers
+   ros2 topic info -v /shared_lidar/scan_endpoints
+   ros2 topic info -v /shared_lidar/robot_footprints
+
+   timeout 25s python3 ~/ros_ws/src/trust_costmap/scripts/check_shared_mapping.py 20
+
+7. Verify every enabled robot has scan input. Adapt robot IDs to scenario.yaml if needed:
+
+   for r in benign_1 benign_2 malicious_1; do
+     echo "=== $r ==="
+     timeout 8s ros2 topic hz "/$r/scan" || true
+     timeout 8s ros2 topic echo --once "/$r/odom" || true
+     timeout 8s ros2 topic echo --once "/$r/combined_map" | head -80 || true
+   done
+
+MAP CONTENT TESTS
+8. Check that the occupancy grid is initially mostly unknown, then gains observed cells. Run this while the launch is active:
+
+   python3 - <<'PY'
+   import time
+   import rclpy
+   from nav_msgs.msg import OccupancyGrid
+   from rclpy.node import Node
+
+   class Probe(Node):
+       def __init__(self):
+           super().__init__('combined_map_probe')
+           self.msg = None
+           self.create_subscription(OccupancyGrid, '/benign_1/combined_map', self.cb, 10)
+       def cb(self, msg):
+           self.msg = msg
+
+   rclpy.init()
+   node = Probe()
+   for label, wait_sec in [('early', 5), ('later', 30)]:
+       deadline = time.time() + wait_sec
+       while time.time() < deadline:
+           rclpy.spin_once(node, timeout_sec=0.25)
+       if node.msg is None:
+           print(label, 'NO MESSAGE')
+           continue
+       data = list(node.msg.data)
+       unknown = sum(v < 0 for v in data)
+       observed = len(data) - unknown
+       occupied = sum(v >= 65 for v in data)
+       free = sum(0 <= v <= 35 for v in data)
+       print(label, {'total': len(data), 'unknown': unknown, 'observed': observed, 'free': free, 'occupied': occupied})
+   node.destroy_node()
+   rclpy.shutdown()
+   PY
+
+Expected:
+- The early map should not already contain the full static floor plan.
+- Unknown should be a large majority at startup.
+- Observed should increase as robots move and scan.
+- Previously observed areas should remain visible.
+- The combined maps for robots should converge to the same shared union because sharing is immediate in this phase.
+
+9. Compare robot combined maps after at least 30 seconds:
+
+   python3 - <<'PY'
+   import time
+   import rclpy
+   from nav_msgs.msg import OccupancyGrid
+   from rclpy.node import Node
+
+   robots = ['benign_1', 'benign_2', 'malicious_1']
+   class Probe(Node):
+       def __init__(self):
+           super().__init__('map_compare_probe')
+           self.maps = {}
+           self.subs = []
+           for robot in robots:
+               self.subs.append(self.create_subscription(
+                   OccupancyGrid, f'/{robot}/combined_map',
+                   lambda msg, r=robot: self.maps.__setitem__(r, list(msg.data)), 10))
+   rclpy.init()
+   node = Probe()
+   deadline = time.time() + 20
+   while time.time() < deadline and len(node.maps) < len(robots):
+       rclpy.spin_once(node, timeout_sec=0.25)
+   for a in robots:
+       for b in robots:
+           if a < b and a in node.maps and b in node.maps:
+               diff = sum(x != y for x, y in zip(node.maps[a], node.maps[b]))
+               print(a, b, 'different_cells=', diff)
+   node.destroy_node()
+   rclpy.shutdown()
+   PY
+
+Expected: different_cells should normally be 0 because all local LiDAR evidence is fused immediately for every robot.
+
+VISUAL RVIZ ACCEPTANCE
+10. Inspect RViz manually:
+- Fixed frame is map.
+- There is no static blue/purple rendering of the entire map at startup.
+- Only LiDAR-observed cells are rendered.
+- Blue means low occupancy probability/free evidence.
+- Violet to dark purple means increasing occupied probability.
+- Unobserved cells are transparent/absent, with the light RViz background visible.
+- Current obstacle-hit endpoints appear in distinct bright colors per robot.
+- All robot square footprints appear and move.
+- As robots drive, the explored region expands and old explored areas remain.
+- No second RViz window is launched.
+
+LOG / FAILURE TRIAGE
+11. Search the log:
+
+   grep -nE 'Traceback|AttributeError|process has died|Segmentation fault|GLSL|QoS|No executable found|PackageNotFoundError|ERROR|FATAL' \
+     /tmp/trust_costmap_test/launch.log || true
+
+Common fixes:
+- "No executable found" for lidar_mapper:
+  inspect setup.py console_scripts, rebuild after deleting build/trust_costmap and install/trust_costmap, then source install/setup.bash.
+- Config or launch file missing from install:
+  inspect setup.py data_files and rebuild.
+- No /<robot>/scan:
+  confirm bridge_robot_topics:=true and inspect ros_gz_bridge command/topic names.
+- Empty heatmap but scans exist:
+  inspect robot pose topics and mapper logs. Confirm robot pose is inside map bounds. Check /<robot>/map_pose type; supported types are PoseStamped, Pose2D, and Odometry. Otherwise the mapper uses odom anchored to scenario start_cell.
+- Full map visible immediately:
+  disable any static GridCells/Map display and confirm only /shared_lidar/probability_markers is enabled. The base launch's older RViz/mapping is intentionally forced off by rviz_shared_mapping.launch.py when those arguments exist.
+- RViz GLSL indexed_8bit_image error:
+  confirm no rviz_default_plugins/Map display is enabled. MarkerArray is the intended renderer.
+- Launch shuts down immediately:
+  find the first process that died. Do not treat Gazebo SIGTERM/SIGKILL during cascading shutdown as the root cause.
+- High CPU:
+  set scan_stride:=2, mapping_resolution_m:=0.15, mapping_publish_rate_hz:=1.0, and gazebo_low_graphics:=true.
+- Robot locations are offset:
+  compare /<robot>/map_pose or /<robot>/odom with scenario start_cell. Prefer correcting the map_pose publisher rather than adding arbitrary visual offsets.
+
+CODE REVIEW CHECKS
+12. Confirm by inspection:
+- The mapper never reads static map cell symbols after parsing width/height.
+- Unknown cells have observed count 0 and are omitted from MarkerArray.
+- Free rays exclude an occupied endpoint; hit endpoints receive positive log odds.
+- Infinite/max-range beams mark free space only within max_mapping_range_m.
+- Log odds are clamped.
+- Shared map for robot R is the fusion of every other robot's local map.
+- Combined map is the fusion of every robot's local map.
+- No publisher exists for /planning_costmap, /base_map, /map_claims, /trust_updates, /planned_path, or cmd_vel in lidar_mapping_node.py.
+
+FINAL PACKAGING
+After all fixes and successful tests, create a complete ZIP of the updated checkout. From the extracted update bundle run:
+
+  bash make_full_repo_zip.sh ~/ros_ws/src/trust_costmap ~/trust_costmap_shared_lidar_fixed.zip
+
+Confirm the ZIP exists and report its path and size. Do not include `.git`, workspace build/install/log directories, Python caches, or `.pre_shared_lidar_backup` files.
+
+FINAL REPORT
+Report:
+- Build and test results.
+- Exact launch command used.
+- Topic/message availability for every robot.
+- Early vs later unknown/observed/free/occupied counts.
+- Whether all combined maps match.
+- Any log errors and the first root-cause error.
+- Whether visual acceptance passed.
+- Every code change made during debugging, with file names and reasons.

@@ -1,907 +1,801 @@
-"""Per-robot LiDAR mapping, map sharing, and RViz visualization node.
+#!/usr/bin/env python3
+"""Shared multi-robot LiDAR occupancy mapping and RViz visualization.
 
-This node is deliberately isolated from the experiment planner.  It reads a
-robot's scan and map-frame pose, builds local/current/shared/combined occupancy
-layers, and publishes RViz-friendly markers.  It never writes to
-``/planning_costmap`` or ``/<robot>/cmd_vel``.
+Displayed cells come only from raycast observations (Gazebo LaserScan and/or an
+immediate MovingAI map raycast used when GPU LiDAR is too slow). The static map
+is never drawn wholesale into RViz.
 """
 
 from __future__ import annotations
 
 import math
-import time
+import os
+import struct
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import rclpy
-from geometry_msgs.msg import Point, PoseStamped, TransformStamped
-from nav_msgs.msg import GridCells, OccupancyGrid, Odometry
+from builtin_interfaces.msg import Duration
+from geometry_msgs.msg import Point, Pose2D, PoseStamped
+from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.node import Node
-from rclpy.qos import (
-    DurabilityPolicy,
-    HistoryPolicy,
-    QoSProfile,
-    ReliabilityPolicy,
-    qos_profile_sensor_data,
-)
-from sensor_msgs.msg import LaserScan
-from std_msgs.msg import ColorRGBA
-from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import LaserScan, PointCloud2, PointField
+from std_msgs.msg import ColorRGBA, Header
 from visualization_msgs.msg import Marker, MarkerArray
+import yaml
 
-from .mapping_utils import (
-    aggregate_log_odds,
+from .shared_mapping_utils import (
     bresenham_cells,
-    cell_index,
-    cell_to_world,
-    clamp,
-    in_bounds,
-    logistic,
-    occupancy_to_log_odds,
-    probability_to_occupancy,
-    quaternion_from_yaw,
-    transform_local_odometry_to_map,
-    world_to_cell,
-    yaw_from_quaternion,
+    grid_to_world,
+    heatmap_rgba,
+    load_movingai_occupancy,
+    normalize_angle,
+    probability_from_log_odds,
+    quaternion_to_yaw,
+    raycast_lidar_ranges,
+    world_to_grid,
 )
 
 
-Pose2D = Tuple[float, float, float]
+ROBOT_COLORS: Sequence[Tuple[float, float, float]] = (
+    (1.00, 0.18, 0.12),
+    (0.10, 0.95, 0.25),
+    (1.00, 0.75, 0.05),
+    (0.10, 0.90, 1.00),
+    (1.00, 0.20, 0.85),
+    (0.95, 0.95, 0.95),
+    (0.55, 1.00, 0.10),
+    (1.00, 0.45, 0.05),
+)
 
 
-class LidarMappingNode(Node):
-    """Build and share occupancy evidence for one scenario robot."""
+@dataclass
+class PoseEstimate:
+    x: float
+    y: float
+    yaw: float
+    stamp_ns: int = 0
+    source: str = "scenario"
 
+
+@dataclass
+class RobotState:
+    robot_id: str
+    initial_pose: PoseEstimate
+    local_log_odds: np.ndarray
+    local_observed: np.ndarray
+    current_log_odds: np.ndarray
+    current_observed: np.ndarray
+    pose: PoseEstimate
+    first_odom: Optional[PoseEstimate] = None
+    map_pose_subscription_created: bool = False
+    map_pose_type: str = ""
+    latest_hit_points: List[Tuple[float, float]] = field(default_factory=list)
+    scan_count: int = 0
+    last_real_scan_ns: int = 0
+    last_scan_source: str = ""
+
+
+class SharedLidarMapper(Node):
     def __init__(self) -> None:
-        super().__init__("lidar_mapper")
+        super().__init__("shared_lidar_mapper")
 
-        self.declare_parameter("robot_id", "robot")
-        self.declare_parameter("peer_robot_ids", [""])
-        self.declare_parameter("map_width", 1)
-        self.declare_parameter("map_height", 1)
-        self.declare_parameter("resolution", 0.5)
-        self.declare_parameter("spawn_x", 0.0)
-        self.declare_parameter("spawn_y", 0.0)
-        self.declare_parameter("spawn_yaw", 0.0)
-        self.declare_parameter("scan_topic", "")
-        self.declare_parameter("odom_topic", "")
-        self.declare_parameter("map_pose_topic", "")
-        self.declare_parameter("map_frame", "map")
+        self.declare_parameter("robot_ids", ["benign_1", "benign_2", "malicious_1"])
+        self.declare_parameter("map_path", "")
+        self.declare_parameter("scenario_path", "")
+        self.declare_parameter("cell_size_m", 0.5)
+        self.declare_parameter("mapping_resolution_m", 0.10)
         self.declare_parameter("publish_rate_hz", 2.0)
-        self.declare_parameter("scan_stride", 1)
+        self.declare_parameter("max_mapping_range_m", 3.5)
         self.declare_parameter("free_log_odds_delta", -0.40)
         self.declare_parameter("occupied_log_odds_delta", 0.85)
-        self.declare_parameter("maximum_absolute_log_odds", 8.0)
-        self.declare_parameter("distance_falloff_m", 5.0)
-        self.declare_parameter("minimum_observation_weight", 0.25)
-        self.declare_parameter("peer_evidence_scale", 1.0)
-        self.declare_parameter("current_priority_scale", 0.50)
-        self.declare_parameter("lidar_height_m", 0.18)
-        self.declare_parameter("footprint_length_m", 0.18)
-        self.declare_parameter("footprint_width_m", 0.14)
-        self.declare_parameter("maximum_scan_range_m", 3.5)
-        self.declare_parameter("enable_rviz_outputs", True)
+        self.declare_parameter("min_log_odds", -4.0)
+        self.declare_parameter("max_log_odds", 4.0)
+        self.declare_parameter("hit_epsilon_m", 0.04)
+        self.declare_parameter("scan_stride", 1)
+        self.declare_parameter("footprint_size_m", 0.34)
+        self.declare_parameter("map_frame", "map")
+        # Gazebo gpu_lidar on software-rendered VMs can take minutes; raycast the
+        # MovingAI walls immediately so RViz fills as soon as poses are known.
+        self.declare_parameter("simulate_lidar_from_map", True)
+        self.declare_parameter("simulated_lidar_beams", 72)
+        self.declare_parameter("simulated_lidar_hz", 5.0)
+        self.declare_parameter("prefer_real_scan_for_sec", 1.0)
 
-        self.robot_id = str(self.get_parameter("robot_id").value).strip()
-        if not self.robot_id:
-            raise ValueError("robot_id must not be empty")
-
-        raw_peers = self.get_parameter("peer_robot_ids").value
-        self.peer_robot_ids = [
-            str(value).strip()
-            for value in raw_peers
-            if str(value).strip() and str(value).strip() != self.robot_id
-        ]
-        self.width = int(self.get_parameter("map_width").value)
-        self.height = int(self.get_parameter("map_height").value)
-        self.resolution = float(self.get_parameter("resolution").value)
-        if self.width <= 0 or self.height <= 0:
-            raise ValueError("map_width and map_height must be positive")
-        if self.resolution <= 0.0:
-            raise ValueError("resolution must be positive")
-
-        self.size = self.width * self.height
-        self.spawn_pose: Pose2D = (
-            float(self.get_parameter("spawn_x").value),
-            float(self.get_parameter("spawn_y").value),
-            float(self.get_parameter("spawn_yaw").value),
-        )
-        self.map_frame = str(self.get_parameter("map_frame").value).strip() or "map"
-        self.scan_frame = f"{self.robot_id}/base_scan"
-        self.base_frame = f"{self.robot_id}/base_link"
-
+        self.robot_ids = [str(value) for value in self.get_parameter("robot_ids").value]
+        self.map_path = str(self.get_parameter("map_path").value)
+        self.scenario_path = str(self.get_parameter("scenario_path").value)
+        self.cell_size = float(self.get_parameter("cell_size_m").value)
+        self.resolution = float(self.get_parameter("mapping_resolution_m").value)
+        self.max_mapping_range = float(self.get_parameter("max_mapping_range_m").value)
         self.free_delta = float(self.get_parameter("free_log_odds_delta").value)
-        self.occupied_delta = float(
-            self.get_parameter("occupied_log_odds_delta").value
-        )
-        if self.free_delta >= 0.0:
-            raise ValueError("free_log_odds_delta must be negative")
-        if self.occupied_delta <= 0.0:
-            raise ValueError("occupied_log_odds_delta must be positive")
-        self.log_odds_limit = max(
-            0.1,
-            abs(float(self.get_parameter("maximum_absolute_log_odds").value)),
-        )
-        self.distance_falloff_m = max(
-            0.01, float(self.get_parameter("distance_falloff_m").value)
-        )
-        self.minimum_observation_weight = clamp(
-            float(self.get_parameter("minimum_observation_weight").value),
-            0.0,
-            1.0,
-        )
-        self.peer_evidence_scale = max(
-            0.0, float(self.get_parameter("peer_evidence_scale").value)
-        )
-        self.current_priority_scale = max(
-            0.0, float(self.get_parameter("current_priority_scale").value)
-        )
+        self.occupied_delta = float(self.get_parameter("occupied_log_odds_delta").value)
+        self.min_log_odds = float(self.get_parameter("min_log_odds").value)
+        self.max_log_odds = float(self.get_parameter("max_log_odds").value)
+        self.hit_epsilon = float(self.get_parameter("hit_epsilon_m").value)
         self.scan_stride = max(1, int(self.get_parameter("scan_stride").value))
-        self.lidar_height_m = max(
-            0.0, float(self.get_parameter("lidar_height_m").value)
+        self.footprint_size = float(self.get_parameter("footprint_size_m").value)
+        self.map_frame = str(self.get_parameter("map_frame").value)
+        self.simulate_lidar_from_map = bool(
+            self.get_parameter("simulate_lidar_from_map").value
         )
-        self.footprint_length_m = max(
-            0.05, float(self.get_parameter("footprint_length_m").value)
+        self.simulated_lidar_beams = max(
+            8, int(self.get_parameter("simulated_lidar_beams").value)
         )
-        self.footprint_width_m = max(
-            0.05, float(self.get_parameter("footprint_width_m").value)
+        self.simulated_lidar_hz = max(
+            0.5, float(self.get_parameter("simulated_lidar_hz").value)
         )
-        self.maximum_scan_range_m = max(
-            0.1, float(self.get_parameter("maximum_scan_range_m").value)
-        )
-        self.enable_rviz_outputs = bool(
-            self.get_parameter("enable_rviz_outputs").value
-        )
-
-        self.local_log_odds = [0.0] * self.size
-        self.local_observed = bytearray(self.size)
-        self.current_log_odds = [0.0] * self.size
-        self.current_observed = bytearray(self.size)
-        self.peer_layers: Dict[str, Tuple[List[float], bytearray]] = {}
-
-        self.map_pose: Optional[Pose2D] = None
-        self.last_map_pose_monotonic = 0.0
-        self.initial_odom_pose: Optional[Pose2D] = None
-        self.received_scan_count = 0
-        self.last_missing_pose_warning = 0.0
-        self.last_peer_warning: Dict[str, float] = {}
-
-        map_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        )
-        marker_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=2,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        self.prefer_real_scan_for_sec = max(
+            0.0, float(self.get_parameter("prefer_real_scan_for_sec").value)
         )
 
-        self.local_map_pub = self.create_publisher(
-            OccupancyGrid, "local_map", map_qos
-        )
-        self.current_map_pub = self.create_publisher(
-            OccupancyGrid, "current_observation_map", map_qos
-        )
-        self.shared_map_pub = self.create_publisher(
-            OccupancyGrid, "shared_map", map_qos
-        )
-        self.combined_map_pub = self.create_publisher(
-            OccupancyGrid, "combined_map", map_qos
-        )
-        self.scan_rviz_pub = None
-        self.combined_markers_pub = None
-        self.local_markers_pub = None
-        self.shared_markers_pub = None
-        self.current_markers_pub = None
-        self.footprint_markers_pub = None
-        self.lidar_free_cells_pub = None
-        self.lidar_occupied_cells_pub = None
-        # Always republish scans into a Reliable topic so RViz can show every
-        # robot's LiDAR (shared visualization). Heavy markers stay optional.
-        scan_rviz_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=5,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-        )
-        self.scan_rviz_pub = self.create_publisher(
-            LaserScan, "scan_rviz", scan_rviz_qos
-        )
-        if self.enable_rviz_outputs:
-            self.combined_markers_pub = self.create_publisher(
-                MarkerArray, "combined_probability_markers", marker_qos
-            )
-            self.local_markers_pub = self.create_publisher(
-                MarkerArray, "local_history_markers", marker_qos
-            )
-            self.shared_markers_pub = self.create_publisher(
-                MarkerArray, "shared_history_markers", marker_qos
-            )
-            self.current_markers_pub = self.create_publisher(
-                MarkerArray, "current_observation_markers", marker_qos
-            )
-            self.footprint_markers_pub = self.create_publisher(
-                MarkerArray, "footprint_markers", marker_qos
-            )
-            # GridCells avoid the broken OccupancyGrid Map shader on many VMs.
-            self.lidar_free_cells_pub = self.create_publisher(
-                GridCells, "lidar_free_cells", marker_qos
-            )
-            self.lidar_occupied_cells_pub = self.create_publisher(
-                GridCells, "lidar_occupied_cells", marker_qos
+        if self.resolution <= 0.0:
+            raise ValueError("mapping_resolution_m must be positive")
+
+        map_width_cells, map_height_cells = self._load_map_dimensions(self.map_path)
+        self.world_width = map_width_cells * self.cell_size
+        self.world_height = map_height_cells * self.cell_size
+        self.origin_x = 0.0
+        self.origin_y = 0.0
+        self.grid_width = int(math.ceil(self.world_width / self.resolution))
+        self.grid_height = int(math.ceil(self.world_height / self.resolution))
+        self.grid_shape = (self.grid_height, self.grid_width)
+        self.map_occupied: Optional[np.ndarray] = None
+        if self.simulate_lidar_from_map:
+            self.map_occupied, _, _ = load_movingai_occupancy(self.map_path)
+
+        starts = self._load_scenario_starts(self.scenario_path)
+        self.states: Dict[str, RobotState] = {}
+        for robot_id in self.robot_ids:
+            initial = starts.get(robot_id, PoseEstimate(0.0, 0.0, 0.0))
+            self.states[robot_id] = RobotState(
+                robot_id=robot_id,
+                initial_pose=initial,
+                local_log_odds=np.zeros(self.grid_shape, dtype=np.float32),
+                local_observed=np.zeros(self.grid_shape, dtype=np.uint16),
+                current_log_odds=np.zeros(self.grid_shape, dtype=np.float32),
+                current_observed=np.zeros(self.grid_shape, dtype=np.uint16),
+                pose=PoseEstimate(initial.x, initial.y, initial.yaw, source="scenario"),
             )
 
-        scan_topic = str(self.get_parameter("scan_topic").value).strip()
-        odom_topic = str(self.get_parameter("odom_topic").value).strip()
-        map_pose_topic = str(self.get_parameter("map_pose_topic").value).strip()
-        if not scan_topic:
-            scan_topic = f"/{self.robot_id}/scan"
-        if not odom_topic:
-            odom_topic = f"/{self.robot_id}/odom"
-        if not map_pose_topic:
-            map_pose_topic = f"/{self.robot_id}/map_pose"
+        # Match ros_gz_bridge LaserScan/Odometry publishers (RELIABLE/VOLATILE).
+        sensor_qos = QoSProfile(depth=8)
+        sensor_qos.reliability = ReliabilityPolicy.RELIABLE
+        sensor_qos.durability = DurabilityPolicy.VOLATILE
 
-        self.scan_sub = self.create_subscription(
-            LaserScan, scan_topic, self.scan_callback, qos_profile_sensor_data
-        )
-        self.odom_sub = self.create_subscription(
-            Odometry, odom_topic, self.odom_callback, 20
-        )
-        self.map_pose_sub = self.create_subscription(
-            PoseStamped, map_pose_topic, self.map_pose_callback, 20
-        )
+        # Use VOLATILE for RViz displays. Transient-local MarkerArray publishers
+        # often fail to match RViz subscriptions on Jazzy, leaving only /planned_path.
+        viz_qos = QoSProfile(depth=5)
+        viz_qos.reliability = ReliabilityPolicy.RELIABLE
+        viz_qos.durability = DurabilityPolicy.VOLATILE
 
-        self.peer_subscriptions = []
-        for peer_id in self.peer_robot_ids:
-            subscription = self.create_subscription(
-                OccupancyGrid,
-                f"/{peer_id}/local_map",
-                lambda message, source=peer_id: self.peer_map_callback(
-                    source, message
+        map_qos = QoSProfile(depth=1)
+        map_qos.reliability = ReliabilityPolicy.RELIABLE
+        map_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+
+        self.heatmap_pub = self.create_publisher(
+            MarkerArray, "/shared_lidar/probability_markers", viz_qos
+        )
+        self.endpoint_pub = self.create_publisher(
+            MarkerArray, "/shared_lidar/scan_endpoints", viz_qos
+        )
+        self.footprint_pub = self.create_publisher(
+            MarkerArray, "/shared_lidar/robot_footprints", viz_qos
+        )
+        self.heatmap_cloud_pub = self.create_publisher(
+            PointCloud2, "/shared_lidar/probability_cloud", viz_qos
+        )
+        self._occupancy_publish_counter = 0
+
+        self.map_publishers: Dict[str, Dict[str, object]] = {}
+        self.subscriptions_kept_alive: List[object] = []
+        for robot_id in self.robot_ids:
+            self.map_publishers[robot_id] = {
+                "current": self.create_publisher(
+                    OccupancyGrid, f"/{robot_id}/current_observation_map", map_qos
                 ),
-                map_qos,
+                "local": self.create_publisher(
+                    OccupancyGrid, f"/{robot_id}/local_map", map_qos
+                ),
+                "shared": self.create_publisher(
+                    OccupancyGrid, f"/{robot_id}/shared_map", map_qos
+                ),
+                "combined": self.create_publisher(
+                    OccupancyGrid, f"/{robot_id}/combined_map", map_qos
+                ),
+            }
+            self.subscriptions_kept_alive.append(
+                self.create_subscription(
+                    LaserScan,
+                    f"/{robot_id}/scan",
+                    lambda msg, rid=robot_id: self._scan_callback(rid, msg),
+                    sensor_qos,
+                )
             )
-            self.peer_subscriptions.append(subscription)
+            self.subscriptions_kept_alive.append(
+                self.create_subscription(
+                    Odometry,
+                    f"/{robot_id}/odom",
+                    lambda msg, rid=robot_id: self._odom_callback(rid, msg),
+                    sensor_qos,
+                )
+            )
 
-        self.tf_broadcaster = TransformBroadcaster(self)
-        self.static_tf_broadcaster = StaticTransformBroadcaster(self)
-        self.publish_static_lidar_transform()
-
-        publish_rate_hz = max(
-            0.2, float(self.get_parameter("publish_rate_hz").value)
-        )
-        self.publish_timer = self.create_timer(
-            1.0 / publish_rate_hz, self.publish_all_layers
-        )
+        publish_rate = max(0.2, float(self.get_parameter("publish_rate_hz").value))
+        self.create_timer(1.0 / publish_rate, self._publish_all)
+        self.create_timer(1.0, self._discover_map_pose_topics)
+        if self.simulate_lidar_from_map and self.map_occupied is not None:
+            self.create_timer(1.0 / self.simulated_lidar_hz, self._simulate_lidar_tick)
+            self.get_logger().info(
+                "Immediate map-raycast LiDAR enabled "
+                f"({self.simulated_lidar_beams} beams @ {self.simulated_lidar_hz:.1f} Hz). "
+                "Gazebo scans are still used when they arrive."
+            )
 
         self.get_logger().info(
-            "LiDAR mapping ready: "
-            f"robot={self.robot_id}, peers={self.peer_robot_ids}, "
-            f"map={self.width}x{self.height}@{self.resolution:.3f}m, "
-            f"scan={scan_topic}, pose={map_pose_topic}, "
-            f"rviz_outputs={self.enable_rviz_outputs}"
+            "Shared LiDAR mapper ready: robots=%s grid=%dx%d resolution=%.3fm "
+            "world=%.2fx%.2fm. Only raycast-observed cells are visualized."
+            % (
+                ",".join(self.robot_ids),
+                self.grid_width,
+                self.grid_height,
+                self.resolution,
+                self.world_width,
+                self.world_height,
+            )
         )
 
-    # ------------------------------------------------------------------
-    # Pose and TF handling
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _load_map_dimensions(map_path: str) -> Tuple[int, int]:
+        if not map_path or not os.path.exists(map_path):
+            raise FileNotFoundError(f"MovingAI map not found: {map_path}")
+        width = None
+        height = None
+        with open(map_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                clean = line.strip()
+                if clean.startswith("width "):
+                    width = int(clean.split()[1])
+                elif clean.startswith("height "):
+                    height = int(clean.split()[1])
+                elif clean == "map":
+                    break
+        if width is None or height is None:
+            raise RuntimeError(f"Invalid MovingAI map metadata: {map_path}")
+        return width, height
 
-    def map_pose_callback(self, message: PoseStamped) -> None:
-        orientation = message.pose.orientation
-        self.map_pose = (
-            float(message.pose.position.x),
-            float(message.pose.position.y),
-            yaw_from_quaternion(
-                orientation.x,
-                orientation.y,
-                orientation.z,
-                orientation.w,
+    def _load_scenario_starts(self, scenario_path: str) -> Dict[str, PoseEstimate]:
+        result: Dict[str, PoseEstimate] = {}
+        if not scenario_path or not os.path.exists(scenario_path):
+            self.get_logger().warning(
+                f"Scenario file not found; pose anchoring will rely on odometry: {scenario_path}"
+            )
+            return result
+        with open(scenario_path, "r", encoding="utf-8") as handle:
+            scenario = yaml.safe_load(handle) or {}
+        scenario_cell_size = float(
+            (scenario.get("visualization") or {}).get("cell_size_m", self.cell_size)
+        )
+        for robot in scenario.get("robots", []):
+            if not robot.get("enabled", True):
+                continue
+            robot_id = str(robot.get("id", ""))
+            start = robot.get("start_cell")
+            if not robot_id or not isinstance(start, (list, tuple)) or len(start) < 2:
+                continue
+            row = int(start[0])
+            col = int(start[1])
+            yaw = float(robot.get("start_yaw", robot.get("yaw", 0.0)))
+            result[robot_id] = PoseEstimate(
+                x=(col + 0.5) * scenario_cell_size,
+                y=(row + 0.5) * scenario_cell_size,
+                yaw=yaw,
+                source="scenario",
+            )
+        return result
+
+    def _discover_map_pose_topics(self) -> None:
+        """Subscribe to /<robot>/map_pose using whichever supported type is present."""
+        topic_types = dict(self.get_topic_names_and_types())
+        for robot_id, state in self.states.items():
+            if state.map_pose_subscription_created:
+                continue
+            topic = f"/{robot_id}/map_pose"
+            types = topic_types.get(topic, [])
+            if not types:
+                continue
+            chosen = types[0]
+            if "geometry_msgs/msg/PoseStamped" in types:
+                chosen = "geometry_msgs/msg/PoseStamped"
+                msg_type = PoseStamped
+                callback = lambda msg, rid=robot_id: self._pose_stamped_callback(rid, msg)
+            elif "geometry_msgs/msg/Pose2D" in types:
+                chosen = "geometry_msgs/msg/Pose2D"
+                msg_type = Pose2D
+                callback = lambda msg, rid=robot_id: self._pose2d_callback(rid, msg)
+            elif "nav_msgs/msg/Odometry" in types:
+                chosen = "nav_msgs/msg/Odometry"
+                msg_type = Odometry
+                callback = lambda msg, rid=robot_id: self._map_odom_callback(rid, msg)
+            else:
+                self.get_logger().warning(
+                    f"Unsupported map_pose type on {topic}: {', '.join(types)}; using odom fallback"
+                )
+                state.map_pose_subscription_created = True
+                state.map_pose_type = "unsupported"
+                continue
+            qos = QoSProfile(depth=10)
+            qos.reliability = ReliabilityPolicy.RELIABLE
+            self.subscriptions_kept_alive.append(
+                self.create_subscription(msg_type, topic, callback, qos)
+            )
+            state.map_pose_subscription_created = True
+            state.map_pose_type = chosen
+            self.get_logger().info(f"Using {topic} ({chosen}) for global LiDAR placement")
+
+    def _pose_stamped_callback(self, robot_id: str, msg: PoseStamped) -> None:
+        yaw = quaternion_to_yaw(
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z,
+            msg.pose.orientation.w,
+        )
+        self.states[robot_id].pose = PoseEstimate(
+            msg.pose.position.x,
+            msg.pose.position.y,
+            yaw,
+            self.get_clock().now().nanoseconds,
+            "map_pose",
+        )
+
+    def _pose2d_callback(self, robot_id: str, msg: Pose2D) -> None:
+        self.states[robot_id].pose = PoseEstimate(
+            msg.x,
+            msg.y,
+            msg.theta,
+            self.get_clock().now().nanoseconds,
+            "map_pose",
+        )
+
+    def _map_odom_callback(self, robot_id: str, msg: Odometry) -> None:
+        pose = msg.pose.pose
+        yaw = quaternion_to_yaw(
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+        )
+        self.states[robot_id].pose = PoseEstimate(
+            pose.position.x,
+            pose.position.y,
+            yaw,
+            self.get_clock().now().nanoseconds,
+            "map_pose",
+        )
+
+    def _odom_callback(self, robot_id: str, msg: Odometry) -> None:
+        state = self.states[robot_id]
+        # Do not overwrite a functioning map_pose stream with odometry.
+        if state.pose.source == "map_pose":
+            return
+        pose = msg.pose.pose
+        raw = PoseEstimate(
+            pose.position.x,
+            pose.position.y,
+            quaternion_to_yaw(
+                pose.orientation.x,
+                pose.orientation.y,
+                pose.orientation.z,
+                pose.orientation.w,
             ),
+            self.get_clock().now().nanoseconds,
+            "odom",
         )
-        self.last_map_pose_monotonic = time.monotonic()
-        self.publish_dynamic_transform()
+        if state.first_odom is None:
+            state.first_odom = raw
 
-    def odom_callback(self, message: Odometry) -> None:
-        """Use odometry only as a fallback when manager map-pose is unavailable."""
-
-        # The experiment's default kinematic mode publishes map_pose directly.
-        # Prefer it for two seconds before considering wheel-odometry fallback.
-        if time.monotonic() - self.last_map_pose_monotonic < 2.0:
-            return
-
-        position = message.pose.pose.position
-        orientation = message.pose.pose.orientation
-        local_pose = (
-            float(position.x),
-            float(position.y),
-            yaw_from_quaternion(
-                orientation.x,
-                orientation.y,
-                orientation.z,
-                orientation.w,
-            ),
-        )
-        if self.initial_odom_pose is None:
-            self.initial_odom_pose = local_pose
-
-        self.map_pose = transform_local_odometry_to_map(
-            local_pose,
-            self.initial_odom_pose,
-            self.spawn_pose,
-        )
-        self.publish_dynamic_transform()
-
-    def publish_static_lidar_transform(self) -> None:
-        if self.static_tf_broadcaster is None:
-            return
-        transform = TransformStamped()
-        transform.header.stamp = self.get_clock().now().to_msg()
-        transform.header.frame_id = self.base_frame
-        transform.child_frame_id = self.scan_frame
-        transform.transform.translation.z = self.lidar_height_m
-        transform.transform.rotation.w = 1.0
-        self.static_tf_broadcaster.sendTransform(transform)
-
-    def publish_dynamic_transform(self, stamp=None) -> None:
-        if self.map_pose is None or self.tf_broadcaster is None:
-            return
-        x, y, yaw = self.map_pose
-        qx, qy, qz, qw = quaternion_from_yaw(yaw)
-        transform = TransformStamped()
-        transform.header.stamp = stamp or self.get_clock().now().to_msg()
-        transform.header.frame_id = self.map_frame
-        transform.child_frame_id = self.base_frame
-        transform.transform.translation.x = x
-        transform.transform.translation.y = y
-        transform.transform.translation.z = 0.0
-        transform.transform.rotation.x = qx
-        transform.transform.rotation.y = qy
-        transform.transform.rotation.z = qz
-        transform.transform.rotation.w = qw
-        self.tf_broadcaster.sendTransform(transform)
-
-    # ------------------------------------------------------------------
-    # LiDAR processing
-    # ------------------------------------------------------------------
-
-    def observation_weight(self, distance_m: float) -> float:
-        return max(
-            self.minimum_observation_weight,
-            math.exp(-max(0.0, distance_m) / self.distance_falloff_m),
+        first = state.first_odom
+        dx = raw.x - first.x
+        dy = raw.y - first.y
+        rotation = state.initial_pose.yaw - first.yaw
+        cos_r = math.cos(rotation)
+        sin_r = math.sin(rotation)
+        map_dx = cos_r * dx - sin_r * dy
+        map_dy = sin_r * dx + cos_r * dy
+        state.pose = PoseEstimate(
+            state.initial_pose.x + map_dx,
+            state.initial_pose.y + map_dy,
+            normalize_angle(state.initial_pose.yaw + raw.yaw - first.yaw),
+            raw.stamp_ns,
+            "odom",
         )
 
-    def add_evidence(
+    def _inside(self, gx: int, gy: int) -> bool:
+        return 0 <= gx < self.grid_width and 0 <= gy < self.grid_height
+
+    def _apply_delta(
         self,
-        values: List[float],
-        observed: bytearray,
-        index: int,
+        log_odds: np.ndarray,
+        observed: np.ndarray,
+        gx: int,
+        gy: int,
         delta: float,
     ) -> None:
-        observed[index] = 1
-        values[index] = clamp(
-            values[index] + delta,
-            -self.log_odds_limit,
-            self.log_odds_limit,
-        )
+        if not self._inside(gx, gy):
+            return
+        value = float(log_odds[gy, gx]) + delta
+        log_odds[gy, gx] = min(self.max_log_odds, max(self.min_log_odds, value))
+        if observed[gy, gx] < np.iinfo(np.uint16).max:
+            observed[gy, gx] += 1
 
-    def scan_callback(self, message: LaserScan) -> None:
-        if self.map_pose is None:
-            now = time.monotonic()
-            if now - self.last_missing_pose_warning > 5.0:
-                self.get_logger().warning(
-                    f"Waiting for /{self.robot_id}/map_pose or odometry before mapping scans."
-                )
-                self.last_missing_pose_warning = now
+    def _scan_callback(self, robot_id: str, msg: LaserScan) -> None:
+        state = self.states[robot_id]
+        pose = state.pose
+        if not (math.isfinite(pose.x) and math.isfinite(pose.y) and math.isfinite(pose.yaw)):
             return
 
-        self.current_log_odds = [0.0] * self.size
-        self.current_observed = bytearray(self.size)
-
-        robot_x, robot_y, robot_yaw = self.map_pose
-        start_cell = world_to_cell(robot_x, robot_y, self.resolution)
-        if not in_bounds(start_cell, self.height, self.width):
-            self.get_logger().warning(
-                f"Robot pose is outside the mapping grid: pose={self.map_pose}"
-            )
-            return
-
-        reported_range_max = float(message.range_max)
-        range_max = (
-            reported_range_max
-            if math.isfinite(reported_range_max) and reported_range_max > 0.0
-            else self.maximum_scan_range_m
+        usable_max = self.max_mapping_range
+        if math.isfinite(msg.range_max) and msg.range_max > 0.0:
+            usable_max = min(usable_max, float(msg.range_max))
+        usable_min = max(0.0, float(msg.range_min))
+        angle_min = float(msg.angle_min)
+        angle_increment = float(msg.angle_increment)
+        ranges = [float(value) for value in msg.ranges]
+        self._integrate_scan_ranges(
+            robot_id,
+            ranges,
+            angle_min=angle_min,
+            angle_increment=angle_increment,
+            usable_min=usable_min,
+            usable_max=usable_max,
+            sensor_range_max=float(msg.range_max) if math.isfinite(msg.range_max) else usable_max,
+            source="gazebo",
         )
-        range_max = min(range_max, self.maximum_scan_range_m)
-        range_min = max(0.0, float(message.range_min))
-        hit_epsilon = max(0.01, range_max * 0.005)
+        state.last_real_scan_ns = self.get_clock().now().nanoseconds
 
-        for beam_index in range(0, len(message.ranges), self.scan_stride):
-            raw_range = float(message.ranges[beam_index])
-            if math.isnan(raw_range) or raw_range < range_min:
-                continue
-
-            finite_hit = math.isfinite(raw_range) and raw_range < range_max - hit_epsilon
-            distance = raw_range if math.isfinite(raw_range) else range_max
-            distance = clamp(distance, range_min, range_max)
-            if distance <= 0.0:
-                continue
-
-            beam_angle = (
-                robot_yaw
-                + float(message.angle_min)
-                + beam_index * float(message.angle_increment)
-            )
-            endpoint_x = robot_x + distance * math.cos(beam_angle)
-            endpoint_y = robot_y + distance * math.sin(beam_angle)
-            endpoint_cell = world_to_cell(endpoint_x, endpoint_y, self.resolution)
-            ray = bresenham_cells(start_cell, endpoint_cell)
-
-            endpoint_is_inside = in_bounds(
-                endpoint_cell, self.height, self.width
-            )
-            if finite_hit and endpoint_is_inside:
-                free_cells = ray[:-1]
-            else:
-                free_cells = ray
-
-            weight = self.observation_weight(distance)
-            free_delta = self.free_delta * weight
-            occupied_delta = self.occupied_delta * weight
-
-            for cell in free_cells:
-                if not in_bounds(cell, self.height, self.width):
+    def _simulate_lidar_tick(self) -> None:
+        if self.map_occupied is None:
+            return
+        now_ns = self.get_clock().now().nanoseconds
+        for robot_id, state in self.states.items():
+            if state.last_real_scan_ns > 0:
+                age_sec = (now_ns - state.last_real_scan_ns) * 1e-9
+                if age_sec <= self.prefer_real_scan_for_sec:
                     continue
-                index = cell_index(cell, self.width)
-                self.add_evidence(
-                    self.local_log_odds,
-                    self.local_observed,
-                    index,
-                    free_delta,
-                )
-                self.add_evidence(
-                    self.current_log_odds,
-                    self.current_observed,
-                    index,
-                    free_delta,
-                )
-
-            if finite_hit and endpoint_is_inside:
-                index = cell_index(endpoint_cell, self.width)
-                self.add_evidence(
-                    self.local_log_odds,
-                    self.local_observed,
-                    index,
-                    occupied_delta,
-                )
-                self.add_evidence(
-                    self.current_log_odds,
-                    self.current_observed,
-                    index,
-                    occupied_delta,
-                )
-
-        self.received_scan_count += 1
-        # Use one timestamp for the TF and republished scan so RViz never has
-        # to extrapolate between mismatched "now" values.
-        stamp = self.get_clock().now().to_msg()
-        self.publish_dynamic_transform(stamp)
-        self.publish_rviz_scan(message, stamp)
-        # Publish the current scan immediately; persistent/shared layers remain
-        # rate limited by publish_timer.
-        self.current_map_pub.publish(
-            self.make_occupancy_grid(
-                self.current_log_odds, self.current_observed, stamp
-            )
-        )
-        if self.current_markers_pub is not None:
-            self.current_markers_pub.publish(
-                self.make_probability_markers(
-                    namespace="current_observation",
-                    values=self.current_log_odds,
-                    observed=self.current_observed,
-                    z=0.075,
-                    color_mode="current",
-                    exclude_mask=None,
-                )
-            )
-
-    def publish_rviz_scan(self, message: LaserScan, stamp=None) -> None:
-        rviz_scan = LaserScan()
-        rviz_scan.header.stamp = stamp or self.get_clock().now().to_msg()
-        rviz_scan.header.frame_id = self.scan_frame
-        rviz_scan.angle_min = message.angle_min
-        rviz_scan.angle_max = message.angle_max
-        rviz_scan.angle_increment = message.angle_increment
-        rviz_scan.time_increment = message.time_increment
-        rviz_scan.scan_time = message.scan_time
-        rviz_scan.range_min = message.range_min
-        rviz_scan.range_max = message.range_max
-        rviz_scan.ranges = list(message.ranges)
-        rviz_scan.intensities = list(message.intensities)
-        if self.scan_rviz_pub is not None:
-            self.scan_rviz_pub.publish(rviz_scan)
-
-    # ------------------------------------------------------------------
-    # Peer sharing and map publication
-    # ------------------------------------------------------------------
-
-    def peer_map_callback(self, peer_id: str, message: OccupancyGrid) -> None:
-        valid = (
-            int(message.info.width) == self.width
-            and int(message.info.height) == self.height
-            and math.isclose(
-                float(message.info.resolution),
-                self.resolution,
-                rel_tol=0.0,
-                abs_tol=1e-6,
-            )
-            and len(message.data) == self.size
-        )
-        if not valid:
-            now = time.monotonic()
-            if now - self.last_peer_warning.get(peer_id, 0.0) > 10.0:
-                self.get_logger().warning(
-                    f"Ignoring incompatible local map from {peer_id}: "
-                    f"{message.info.width}x{message.info.height}@"
-                    f"{message.info.resolution}"
-                )
-                self.last_peer_warning[peer_id] = now
-            return
-
-        values = [0.0] * self.size
-        observed = bytearray(self.size)
-        for index, occupancy in enumerate(message.data):
-            numeric = int(occupancy)
-            if numeric < 0:
+            pose = state.pose
+            if not (
+                math.isfinite(pose.x) and math.isfinite(pose.y) and math.isfinite(pose.yaw)
+            ):
                 continue
-            observed[index] = 1
-            values[index] = clamp(
-                occupancy_to_log_odds(numeric),
-                -self.log_odds_limit,
-                self.log_odds_limit,
+            ranges, angle_increment = raycast_lidar_ranges(
+                self.map_occupied,
+                self.cell_size,
+                self.origin_x,
+                self.origin_y,
+                pose.x,
+                pose.y,
+                pose.yaw,
+                self.max_mapping_range,
+                beam_count=self.simulated_lidar_beams,
             )
-        self.peer_layers[peer_id] = (values, observed)
+            self._integrate_scan_ranges(
+                robot_id,
+                ranges,
+                angle_min=0.0,
+                angle_increment=angle_increment,
+                usable_min=0.05,
+                usable_max=self.max_mapping_range,
+                sensor_range_max=self.max_mapping_range,
+                source="map_raycast",
+            )
 
-    def aggregate_shared_layer(self) -> Tuple[List[float], bytearray]:
-        layers = [
-            (values, observed, self.peer_evidence_scale)
-            for values, observed in self.peer_layers.values()
-        ]
-        return aggregate_log_odds(layers, self.size, self.log_odds_limit)
-
-    def aggregate_combined_layer(
-        self, shared_values: Sequence[float], shared_observed: Sequence[int]
-    ) -> Tuple[List[float], bytearray]:
-        return aggregate_log_odds(
-            [
-                (self.local_log_odds, self.local_observed, 1.0),
-                (shared_values, shared_observed, 1.0),
-                (
-                    self.current_log_odds,
-                    self.current_observed,
-                    self.current_priority_scale,
-                ),
-            ],
-            self.size,
-            self.log_odds_limit,
-        )
-
-    def publish_all_layers(self) -> None:
-        stamp = self.get_clock().now().to_msg()
-        shared_values, shared_observed = self.aggregate_shared_layer()
-        combined_values, combined_observed = self.aggregate_combined_layer(
-            shared_values, shared_observed
-        )
-
-        self.local_map_pub.publish(
-            self.make_occupancy_grid(
-                self.local_log_odds, self.local_observed, stamp
-            )
-        )
-        self.current_map_pub.publish(
-            self.make_occupancy_grid(
-                self.current_log_odds, self.current_observed, stamp
-            )
-        )
-        self.shared_map_pub.publish(
-            self.make_occupancy_grid(shared_values, shared_observed, stamp)
-        )
-        self.combined_map_pub.publish(
-            self.make_occupancy_grid(combined_values, combined_observed, stamp)
-        )
-
-        if self.enable_rviz_outputs:
-            self.combined_markers_pub.publish(
-                self.make_probability_markers(
-                    namespace="combined_probability",
-                    values=combined_values,
-                    observed=combined_observed,
-                    z=0.012,
-                    color_mode="heatmap",
-                    exclude_mask=None,
-                )
-            )
-            # "Previously mapped" excludes cells in the newest local scan so the
-            # current observation overlay remains visually distinct.
-            self.local_markers_pub.publish(
-                self.make_probability_markers(
-                    namespace="local_history",
-                    values=self.local_log_odds,
-                    observed=self.local_observed,
-                    z=0.032,
-                    color_mode="local",
-                    exclude_mask=self.current_observed,
-                )
-            )
-            self.shared_markers_pub.publish(
-                self.make_probability_markers(
-                    namespace="shared_history",
-                    values=shared_values,
-                    observed=shared_observed,
-                    z=0.052,
-                    color_mode="shared",
-                    exclude_mask=None,
-                )
-            )
-            self.current_markers_pub.publish(
-                self.make_probability_markers(
-                    namespace="current_observation",
-                    values=self.current_log_odds,
-                    observed=self.current_observed,
-                    z=0.075,
-                    color_mode="current",
-                    exclude_mask=None,
-                )
-            )
-            self.footprint_markers_pub.publish(self.make_footprint_markers())
-            self.publish_lidar_grid_cells(
-                combined_values, combined_observed, stamp
-            )
-            self.publish_dynamic_transform()
-
-        # Keep TF fresh even when heavy RViz markers are disabled.
-        if not self.enable_rviz_outputs:
-            self.publish_dynamic_transform()
-
-    def publish_lidar_grid_cells(
+    def _integrate_scan_ranges(
         self,
-        values: Sequence[float],
-        observed: Sequence[int],
-        stamp: object,
-    ) -> None:
-        if (
-            self.lidar_free_cells_pub is None
-            or self.lidar_occupied_cells_pub is None
-        ):
-            return
-
-        free = GridCells()
-        free.header.stamp = stamp
-        free.header.frame_id = self.map_frame
-        free.cell_width = self.resolution * 0.92
-        free.cell_height = self.resolution * 0.92
-        occupied = GridCells()
-        occupied.header = free.header
-        occupied.cell_width = free.cell_width
-        occupied.cell_height = free.cell_height
-
-        for index in range(self.size):
-            if not observed[index]:
-                continue
-            row, col = divmod(index, self.width)
-            x, y = cell_to_world(row, col, self.resolution)
-            probability = logistic(values[index])
-            if probability >= 0.55:
-                occupied.cells.append(Point(x=x, y=y, z=0.05))
-            else:
-                free.cells.append(Point(x=x, y=y, z=0.02))
-
-        self.lidar_free_cells_pub.publish(free)
-        self.lidar_occupied_cells_pub.publish(occupied)
-
-    def make_occupancy_grid(
-        self,
-        values: Sequence[float],
-        observed: Sequence[int],
-        stamp: object,
-    ) -> OccupancyGrid:
-        message = OccupancyGrid()
-        message.header.stamp = stamp
-        message.header.frame_id = self.map_frame
-        message.info.map_load_time = stamp
-        message.info.resolution = self.resolution
-        message.info.width = self.width
-        message.info.height = self.height
-        message.info.origin.orientation.w = 1.0
-        message.data = [
-            probability_to_occupancy(logistic(values[index]))
-            if observed[index]
-            else -1
-            for index in range(self.size)
-        ]
-        return message
-
-    # ------------------------------------------------------------------
-    # RViz markers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def heatmap_color(probability: float, alpha: float = 0.55) -> ColorRGBA:
-        """Blue free-space / amber occupied overlay (reference-repo style)."""
-
-        p = clamp(probability, 0.0, 1.0)
-        if p <= 0.5:
-            # Free / low occupancy: bright cyan-blue floor.
-            fraction = p / 0.5
-            red = 0.10 + 0.05 * fraction
-            green = 0.55 + 0.20 * fraction
-            blue = 0.95
-            alpha = 0.35 + 0.20 * (1.0 - fraction)
-        else:
-            # Occupied: purple/magenta wall evidence (like reference).
-            fraction = (p - 0.5) / 0.5
-            red = 0.45 + 0.45 * fraction
-            green = 0.15 * (1.0 - fraction)
-            blue = 0.75 - 0.25 * fraction
-            alpha = 0.45 + 0.35 * fraction
-        return ColorRGBA(r=red, g=green, b=blue, a=alpha)
-
-    @staticmethod
-    def layer_color(probability: float, mode: str) -> ColorRGBA:
-        certainty = abs(clamp(probability, 0.0, 1.0) - 0.5) * 2.0
-        alpha = 0.18 + 0.42 * certainty
-        if mode == "local":
-            # Blue local history; occupied cells are darker.
-            return ColorRGBA(
-                r=0.05,
-                g=0.25 + 0.30 * (1.0 - probability),
-                b=0.75 + 0.25 * probability,
-                a=alpha,
-            )
-        if mode == "shared":
-            # Green shared history; occupied cells trend toward magenta.
-            return ColorRGBA(
-                r=0.15 + 0.60 * probability,
-                g=0.75 - 0.30 * probability,
-                b=0.20 + 0.35 * probability,
-                a=alpha,
-            )
-        # Bright current scan: cyan free rays, orange/red obstacle endpoints.
-        return ColorRGBA(
-            r=0.10 + 0.90 * probability,
-            g=0.90 - 0.40 * probability,
-            b=0.95 * (1.0 - probability),
-            a=0.72,
-        )
-
-    def make_probability_markers(
-        self,
+        robot_id: str,
+        ranges: Sequence[float],
         *,
-        namespace: str,
-        values: Sequence[float],
-        observed: Sequence[int],
-        z: float,
-        color_mode: str,
-        exclude_mask: Optional[Sequence[int]],
-    ) -> MarkerArray:
-        array = MarkerArray()
-        clear = Marker()
-        clear.action = Marker.DELETEALL
-        array.markers.append(clear)
+        angle_min: float,
+        angle_increment: float,
+        usable_min: float,
+        usable_max: float,
+        sensor_range_max: float,
+        source: str,
+    ) -> None:
+        state = self.states[robot_id]
+        pose = state.pose
+        if not (math.isfinite(pose.x) and math.isfinite(pose.y) and math.isfinite(pose.yaw)):
+            return
 
+        state.current_log_odds.fill(0.0)
+        state.current_observed.fill(0)
+        hit_points: List[Tuple[float, float]] = []
+
+        start_gx, start_gy = world_to_grid(
+            pose.x, pose.y, self.origin_x, self.origin_y, self.resolution
+        )
+        if not self._inside(start_gx, start_gy):
+            self.get_logger().warning(
+                f"Ignoring {robot_id} scan because robot pose is outside map bounds: "
+                f"({pose.x:.2f}, {pose.y:.2f})",
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        for index in range(0, len(ranges), self.scan_stride):
+            raw_range = float(ranges[index])
+            if math.isnan(raw_range) or raw_range < usable_min:
+                continue
+
+            is_finite_hit = math.isfinite(raw_range)
+            if is_finite_hit:
+                measured = min(raw_range, usable_max)
+                hit = raw_range < usable_max - self.hit_epsilon
+                if math.isfinite(sensor_range_max):
+                    hit = hit and raw_range < float(sensor_range_max) - self.hit_epsilon
+            else:
+                measured = usable_max
+                hit = False
+
+            if measured <= 0.0:
+                continue
+            beam_angle = pose.yaw + angle_min + index * angle_increment
+            end_x = pose.x + measured * math.cos(beam_angle)
+            end_y = pose.y + measured * math.sin(beam_angle)
+            end_gx, end_gy = world_to_grid(
+                end_x, end_y, self.origin_x, self.origin_y, self.resolution
+            )
+            cells = list(bresenham_cells(start_gx, start_gy, end_gx, end_gy))
+            if not cells:
+                continue
+
+            free_cells = cells[:-1] if hit else cells
+            # Skip the sensor's own cell to avoid over-weighting it every beam.
+            for gx, gy in free_cells[1:]:
+                self._apply_delta(
+                    state.local_log_odds, state.local_observed, gx, gy, self.free_delta
+                )
+                self._apply_delta(
+                    state.current_log_odds, state.current_observed, gx, gy, self.free_delta
+                )
+
+            if hit:
+                gx, gy = cells[-1]
+                self._apply_delta(
+                    state.local_log_odds,
+                    state.local_observed,
+                    gx,
+                    gy,
+                    self.occupied_delta,
+                )
+                self._apply_delta(
+                    state.current_log_odds,
+                    state.current_observed,
+                    gx,
+                    gy,
+                    self.occupied_delta,
+                )
+                if self._inside(gx, gy):
+                    hit_points.append((end_x, end_y))
+
+        state.latest_hit_points = hit_points
+        state.scan_count += 1
+        state.last_scan_source = source
+        if state.scan_count == 1 or state.scan_count % 25 == 0:
+            self.get_logger().info(
+                f"Processed {state.scan_count} scans from {robot_id} "
+                f"via {source} (hits={len(hit_points)}, pose=({pose.x:.2f},{pose.y:.2f}))"
+            )
+
+    def _header(self) -> Header:
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = self.map_frame
+        return header
+
+    def _occupancy_grid(self, log_odds: np.ndarray, observed: np.ndarray) -> OccupancyGrid:
+        msg = OccupancyGrid()
+        msg.header = self._header()
+        msg.info.map_load_time = msg.header.stamp
+        msg.info.resolution = float(self.resolution)
+        msg.info.width = int(self.grid_width)
+        msg.info.height = int(self.grid_height)
+        msg.info.origin.position.x = float(self.origin_x)
+        msg.info.origin.position.y = float(self.origin_y)
+        msg.info.origin.position.z = 0.0
+        msg.info.origin.orientation.w = 1.0
+
+        flat_log = log_odds.reshape(-1)
+        flat_seen = observed.reshape(-1)
+        data = np.full(flat_log.shape, -1, dtype=np.int8)
+        indices = np.nonzero(flat_seen > 0)[0]
+        if indices.size:
+            values = flat_log[indices].astype(np.float64)
+            probabilities = np.where(
+                values >= 0.0,
+                1.0 / (1.0 + np.exp(-values)),
+                np.exp(values) / (1.0 + np.exp(values)),
+            )
+            data[indices] = np.rint(probabilities * 100.0).astype(np.int8)
+        msg.data = [int(value) for value in data]
+        return msg
+
+    def _combined_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
+        logs = np.zeros(self.grid_shape, dtype=np.float32)
+        seen = np.zeros(self.grid_shape, dtype=np.uint32)
+        for state in self.states.values():
+            logs += state.local_log_odds
+            seen += state.local_observed.astype(np.uint32)
+        np.clip(logs, self.min_log_odds, self.max_log_odds, out=logs)
+        return logs, seen
+
+    def _publish_all(self) -> None:
+        combined_log, combined_seen = self._combined_arrays()
+        self._publish_heatmap(combined_log, combined_seen)
+        self._publish_endpoints()
+        self._publish_footprints()
+
+        # OccupancyGrid list conversion is expensive; publish less often than markers.
+        self._occupancy_publish_counter += 1
+        if self._occupancy_publish_counter % 2 != 0:
+            return
+
+        for robot_id, state in self.states.items():
+            shared_log = combined_log - state.local_log_odds
+            shared_seen = combined_seen.astype(np.int64) - state.local_observed.astype(np.int64)
+            np.clip(shared_log, self.min_log_odds, self.max_log_odds, out=shared_log)
+            shared_seen = np.maximum(shared_seen, 0).astype(np.uint32)
+            publishers = self.map_publishers[robot_id]
+            publishers["current"].publish(
+                self._occupancy_grid(state.current_log_odds, state.current_observed)
+            )
+            publishers["local"].publish(
+                self._occupancy_grid(state.local_log_odds, state.local_observed)
+            )
+            publishers["shared"].publish(
+                self._occupancy_grid(shared_log, shared_seen)
+            )
+            publishers["combined"].publish(
+                self._occupancy_grid(combined_log, combined_seen)
+            )
+
+    def _publish_heatmap(self, log_odds: np.ndarray, observed: np.ndarray) -> None:
         marker = Marker()
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.header.frame_id = self.map_frame
-        marker.ns = namespace
+        marker.header = self._header()
+        marker.ns = "shared_lidar_probability"
         marker.id = 0
         marker.type = Marker.CUBE_LIST
         marker.action = Marker.ADD
         marker.pose.orientation.w = 1.0
-        marker.scale.x = self.resolution * 0.94
-        marker.scale.y = self.resolution * 0.94
-        marker.scale.z = max(0.008, self.resolution * 0.025)
+        marker.scale.x = self.resolution * 0.95
+        marker.scale.y = self.resolution * 0.95
+        marker.scale.z = max(0.08, self.resolution * 0.70)
+        # RViz can ignore per-point colors when marker.color.a is left at 0.
+        marker.color = ColorRGBA(r=0.2, g=0.4, b=1.0, a=1.0)
+        marker.lifetime = Duration(sec=0, nanosec=0)
 
-        for index in range(self.size):
-            if not observed[index]:
-                continue
-            if exclude_mask is not None and exclude_mask[index]:
-                continue
-            row, col = divmod(index, self.width)
-            x, y = cell_to_world(row, col, self.resolution)
-            marker.points.append(Point(x=x, y=y, z=float(z)))
-            probability = logistic(values[index])
-            if color_mode == "heatmap":
-                marker.colors.append(self.heatmap_color(probability))
-            else:
-                marker.colors.append(self.layer_color(probability, color_mode))
+        cloud_points: List[Tuple[float, float, float, float]] = []
+        ys, xs = np.nonzero(observed > 0)
+        for gy, gx in zip(ys.tolist(), xs.tolist()):
+            world_x, world_y = grid_to_world(
+                gx, gy, self.origin_x, self.origin_y, self.resolution
+            )
+            probability = probability_from_log_odds(float(log_odds[gy, gx]))
+            r, g, b, a = heatmap_rgba(probability)
+            point = Point(x=world_x, y=world_y, z=marker.scale.z * 0.5)
+            marker.points.append(point)
+            marker.colors.append(ColorRGBA(r=r, g=g, b=b, a=max(a, 0.75)))
+            # Pack RGB into a float for PointCloud2 rgb field (RViz RGB8).
+            rgb_uint = (
+                (int(r * 255.0) << 16) | (int(g * 255.0) << 8) | int(b * 255.0)
+            )
+            rgb_float = struct.unpack("<f", struct.pack("<I", rgb_uint))[0]
+            cloud_points.append((world_x, world_y, 0.05, rgb_float))
 
-        if marker.points:
-            array.markers.append(marker)
-        return array
-
-    def make_footprint_markers(self) -> MarkerArray:
         array = MarkerArray()
-        clear = Marker()
-        clear.action = Marker.DELETEALL
-        array.markers.append(clear)
-        if self.map_pose is None:
-            return array
+        array.markers.append(marker)
+        self.heatmap_pub.publish(array)
+        self.heatmap_cloud_pub.publish(self._probability_cloud(cloud_points))
 
-        x, y, yaw = self.map_pose
-        qx, qy, qz, qw = quaternion_from_yaw(yaw)
-        stamp = self.get_clock().now().to_msg()
+    def _probability_cloud(
+        self, points: Sequence[Tuple[float, float, float, float]]
+    ) -> PointCloud2:
+        message = PointCloud2()
+        message.header = self._header()
+        message.height = 1
+        message.width = len(points)
+        message.is_dense = True
+        message.is_bigendian = False
+        message.fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name="rgb", offset=12, datatype=PointField.FLOAT32, count=1),
+        ]
+        message.point_step = 16
+        message.row_step = message.point_step * message.width
+        if points:
+            packed = np.asarray(points, dtype=np.float32)
+            message.data = packed.tobytes()
+        else:
+            message.data = b""
+        return message
 
-        body = Marker()
-        body.header.stamp = stamp
-        body.header.frame_id = self.map_frame
-        body.ns = "turtlebot_footprint"
-        body.id = 0
-        body.type = Marker.CUBE
-        body.action = Marker.ADD
-        body.pose.position.x = x
-        body.pose.position.y = y
-        body.pose.position.z = 0.055
-        body.pose.orientation.x = qx
-        body.pose.orientation.y = qy
-        body.pose.orientation.z = qz
-        body.pose.orientation.w = qw
-        body.scale.x = self.footprint_length_m
-        body.scale.y = self.footprint_width_m
-        body.scale.z = 0.10
-        # White/light square in RViz only (Gazebo keeps the TurtleBot mesh).
-        body.color = ColorRGBA(r=0.95, g=0.95, b=0.98, a=0.95)
-        array.markers.append(body)
+    def _publish_endpoints(self) -> None:
+        array = MarkerArray()
+        for index, robot_id in enumerate(self.robot_ids):
+            state = self.states[robot_id]
+            r, g, b = ROBOT_COLORS[index % len(ROBOT_COLORS)]
+            marker = Marker()
+            marker.header = self._header()
+            marker.ns = "live_lidar_endpoints"
+            marker.id = index
+            marker.type = Marker.SPHERE_LIST
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = max(0.06, self.resolution * 0.70)
+            marker.scale.y = marker.scale.x
+            marker.scale.z = marker.scale.x
+            marker.action = Marker.ADD
+            marker.color = ColorRGBA(r=r, g=g, b=b, a=1.0)
+            marker.points = [
+                Point(x=x, y=y, z=0.12) for x, y in state.latest_hit_points
+            ]
+            if not marker.points:
+                # Keep the namespace alive with an empty ADD instead of DELETE so
+                # RViz does not disable the display namespace after startup.
+                marker.points = []
+            array.markers.append(marker)
+        self.endpoint_pub.publish(array)
 
-        heading = Marker()
-        heading.header = body.header
-        heading.ns = "turtlebot_heading"
-        heading.id = 1
-        heading.type = Marker.ARROW
-        heading.action = Marker.ADD
-        heading.pose.position.x = body.pose.position.x
-        heading.pose.position.y = body.pose.position.y
-        heading.pose.position.z = 0.13
-        heading.pose.orientation.x = body.pose.orientation.x
-        heading.pose.orientation.y = body.pose.orientation.y
-        heading.pose.orientation.z = body.pose.orientation.z
-        heading.pose.orientation.w = body.pose.orientation.w
-        heading.scale.x = self.footprint_length_m * 0.90
-        heading.scale.y = max(0.025, self.footprint_width_m * 0.20)
-        heading.scale.z = max(0.04, self.footprint_width_m * 0.32)
-        heading.color = ColorRGBA(r=1.0, g=0.85, b=0.05, a=1.0)
-        array.markers.append(heading)
+    def _publish_footprints(self) -> None:
+        array = MarkerArray()
+        for index, robot_id in enumerate(self.robot_ids):
+            state = self.states[robot_id]
+            r, g, b = ROBOT_COLORS[index % len(ROBOT_COLORS)]
+            marker = Marker()
+            marker.header = self._header()
+            marker.ns = "robot_footprints"
+            marker.id = index
+            marker.type = Marker.CUBE
+            marker.action = Marker.ADD
+            marker.pose.position.x = state.pose.x
+            marker.pose.position.y = state.pose.y
+            marker.pose.position.z = 0.12
+            marker.pose.orientation.z = math.sin(state.pose.yaw / 2.0)
+            marker.pose.orientation.w = math.cos(state.pose.yaw / 2.0)
+            marker.scale.x = max(0.45, self.footprint_size)
+            marker.scale.y = max(0.45, self.footprint_size)
+            marker.scale.z = 0.10
+            marker.color = ColorRGBA(r=r, g=g, b=b, a=1.0)
+            array.markers.append(marker)
 
-        label = Marker()
-        label.header = body.header
-        label.ns = "turtlebot_label"
-        label.id = 2
-        label.type = Marker.TEXT_VIEW_FACING
-        label.action = Marker.ADD
-        label.pose.position.x = x
-        label.pose.position.y = y
-        label.pose.position.z = 0.32
-        label.pose.orientation.w = 1.0
-        label.scale.z = max(0.14, self.resolution * 0.32)
-        label.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
-        label.text = self.robot_id
-        array.markers.append(label)
+            label = Marker()
+            label.header = self._header()
+            label.ns = "robot_footprints"
+            label.id = 100 + index
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose.position.x = state.pose.x
+            label.pose.position.y = state.pose.y
+            label.pose.position.z = 0.35
+            label.pose.orientation.w = 1.0
+            label.scale.z = 0.28
+            label.color = ColorRGBA(r=0.05, g=0.05, b=0.05, a=1.0)
+            label.text = robot_id
+            array.markers.append(label)
+        self.footprint_pub.publish(array)
 
-        return array
 
-
-def main(args: Optional[List[str]] = None) -> None:
+def main(args=None) -> None:
     rclpy.init(args=args)
-    node: Optional[LidarMappingNode] = None
+    node = SharedLidarMapper()
     try:
-        node = LidarMappingNode()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        if node is not None:
-            node.destroy_node()
+        node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
