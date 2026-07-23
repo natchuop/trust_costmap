@@ -399,6 +399,65 @@ def append_box_model(
     )
 
 
+def append_combined_wall_model(
+    parts: List[str],
+    wall_segments: Sequence[Dict[str, int]],
+    cell_size: float,
+    wall_height: float,
+    wall_z: float,
+    ambient_rgba: str = "0.12 0.12 0.12 1",
+    diffuse_rgba: str = "0.12 0.12 0.12 1",
+) -> None:
+    """Append all horizontal wall segments to one static Gazebo model."""
+    parts.extend(
+        [
+            '    <model name="map_walls">',
+            "      <static>true</static>",
+            "      <pose>0 0 0 0 0 0</pose>",
+            '      <link name="walls_link">',
+        ]
+    )
+
+    for wall_index, segment in enumerate(wall_segments):
+        row = segment["row"]
+        start_col = segment["start_col"]
+        length_cells = segment["length_cells"]
+
+        center_col = start_col + (length_cells / 2.0) - 0.5
+        x = (center_col + 0.5) * cell_size
+        y = (row + 0.5) * cell_size
+        pose = f"{x} {y} {wall_z} 0 0 0"
+        size = f"{length_cells * cell_size} {cell_size} {wall_height}"
+
+        parts.extend(
+            [
+                f'        <collision name="wall_collision_{wall_index}">',
+                f"          <pose>{pose}</pose>",
+                "          <geometry>",
+                "            <box>",
+                f"              <size>{size}</size>",
+                "            </box>",
+                "          </geometry>",
+                "        </collision>",
+                f'        <visual name="wall_visual_{wall_index}">',
+                f"          <pose>{pose}</pose>",
+                "          <cast_shadows>false</cast_shadows>",
+                "          <geometry>",
+                "            <box>",
+                f"              <size>{size}</size>",
+                "            </box>",
+                "          </geometry>",
+                "          <material>",
+                f"            <ambient>{ambient_rgba}</ambient>",
+                f"            <diffuse>{diffuse_rgba}</diffuse>",
+                "          </material>",
+                "        </visual>",
+            ]
+        )
+
+    parts.extend(["      </link>", "    </model>"])
+
+
 def set_xml_child_text(parent: ET.Element, tag: str, value: object) -> None:
     child = parent.find(tag)
     if child is None:
@@ -586,18 +645,13 @@ def generate_sdf_world(
         "0.82 0.82 0.82 1",
     )
 
-    for wall_index, segment in enumerate(wall_segments):
-        center_col = segment["start_col"] + segment["length_cells"] / 2.0 - 0.5
-        x = (center_col + 0.5) * cell_size
-        y = (segment["row"] + 0.5) * cell_size
-        append_box_model(
-            parts,
-            f"wall_segment_{wall_index}",
-            [x, y, wall_z, 0, 0, 0],
-            [segment["length_cells"] * cell_size, cell_size, wall_height],
-            "0.12 0.12 0.12 1",
-            "0.12 0.12 0.12 1",
-        )
+    append_combined_wall_model(
+        parts,
+        wall_segments,
+        cell_size,
+        wall_height,
+        wall_z,
+    )
 
     for robot in enabled_robots(scenario):
         robot_id = str(robot["id"])
